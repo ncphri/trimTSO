@@ -12,4 +12,4 @@ Usage
 ./trimTSO -1 InputF.fastq -2 InputR.fastq -3 output_F.fastq -4 output_R.fastq -s single.fastq -a AAGCAGTGGTATCAACGCAGAGTACATGGG -m 8
 
 
-gzip-hpp(https://github.com/mapbox/gzip-hpp) to decompress gz
+gzip-hpp(https://github.com/mapbox/gzip-hpp) to (de)compress gz
