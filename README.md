@@ -4,7 +4,7 @@ Library amplification using SMART-9N causes repeated insertion of TSO adapter su
 
 Compile
 
-g++ -I ./ -std=c++17 trimTSOgz-modified5.cpp -lz -pthread -O3 -o trimTSOgz-modified5
+g++ -I ./ -std=c++17 trimTSO.cpp -lz -pthread -O3 -o trimTSO
 
 
 Usage
