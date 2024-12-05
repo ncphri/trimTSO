@@ -1,16 +1,19 @@
 #include <iostream>
 #include <fstream>
+#include <filesystem>
 #include <sstream>
 #include <vector>
 #include <string>
 #include <unordered_map>
 #include <algorithm>
-#include <thread>
 #include <mutex>
-#include <queue>
-#include <condition_variable>
 #include <getopt.h>
 #include <zlib.h>
+#include <gzip/compress.hpp>
+#include <gzip/config.hpp>
+#include <gzip/decompress.hpp>
+#include <gzip/utils.hpp>
+#include <gzip/version.hpp>
 
 class AdapterTrimmer {
 private:
@@ -106,9 +109,23 @@ private:
     std::string singleOutputFile;
     std::string adapterSeq;
     int matchLength;
-    bool gzipOutput;
+    int minReadLength;
 
     std::mutex writeMutex;
+
+    // バッファ用メンバ変数
+    std::string out1Buffer;
+    std::string out2Buffer;
+    std::string singleOutBuffer;
+    const size_t bufferLimit = 10 * 1024 * 1024; // 10MB
+
+    // バッファをファイルに書き込む関数
+    void flushBufferToFile(const std::string& buffer, const std::string& fileName) {
+        if (!buffer.empty()) {
+            std::ofstream file(fileName, std::ios_base::app);
+            file << buffer;
+        }
+    }
 
     void processPair(const std::string& readname1, const std::string& read1,
                      const std::string& qual1, const std::string& readname2,
@@ -119,50 +136,61 @@ private:
 
         std::lock_guard<std::mutex> lock(writeMutex);
 
-        if (!trimmedSeq1.empty() && !trimmedSeq2.empty()) {
+        if (trimmedSeq1.size() >= static_cast<size_t>(minReadLength) && trimmedSeq2.size() >= static_cast<size_t>(minReadLength)) {
             // 両リードがトリム可能
-            std::ofstream out1(outputFile1, std::ios_base::app);
-            std::ofstream out2(outputFile2, std::ios_base::app);
-
-            out1 << readname1 << "\n" << trimmedSeq1 << "\n+\n" << trimmedQual1 << "\n";
-            out2 << readname2 << "\n" << trimmedSeq2 << "\n+\n" << trimmedQual2 << "\n";
-        } else if (!trimmedSeq1.empty()) {
+            out1Buffer += readname1 + "\n" + trimmedSeq1 + "\n+\n" + trimmedQual1 + "\n";
+            out2Buffer += readname2 + "\n" + trimmedSeq2 + "\n+\n" + trimmedQual2 + "\n";
+        } else if (trimmedSeq1.size() >= static_cast<size_t>(minReadLength)) {
             // read1のみトリム可能
-            std::ofstream singleOut(singleOutputFile, std::ios_base::app);
-            singleOut << readname1 << "\n" << trimmedSeq1 << "\n+\n" << trimmedQual1 << "\n";
-        } else if (!trimmedSeq2.empty()) {
+            singleOutBuffer += readname1 + "\n" + trimmedSeq1 + "\n+\n" + trimmedQual1 + "\n";
+        } else if (trimmedSeq2.size() >= static_cast<size_t>(minReadLength)) {
             // read2のみトリム可能
-            std::ofstream singleOut(singleOutputFile, std::ios_base::app);
-            singleOut << readname2 << "\n" << trimmedSeq2 << "\n+\n" << trimmedQual2 << "\n";
+            singleOutBuffer += readname2 + "\n" + trimmedSeq2 + "\n+\n" + trimmedQual2 + "\n";
+        }
+
+        // 一定サイズを超えたらバッファをフラッシュ
+        if (out1Buffer.size() >= bufferLimit) {
+            flushBufferToFile(out1Buffer, outputFile1);
+            out1Buffer.clear();
+        }
+        if (out2Buffer.size() >= bufferLimit) {
+            flushBufferToFile(out2Buffer, outputFile2);
+            out2Buffer.clear();
+        }
+        if (singleOutBuffer.size() >= bufferLimit) {
+            flushBufferToFile(singleOutBuffer, singleOutputFile);
+            singleOutBuffer.clear();
         }
     }
 
-    void readFastqFile(std::ifstream& file, std::vector<std::string>& readnames,
-                       std::vector<std::string>& reads, std::vector<std::string>& quals) {
+    void readFastqFromString(const std::string& fastqContent, 
+                       std::vector<std::string>& readnames,
+                       std::vector<std::string>& reads, 
+                       std::vector<std::string>& quals) {
+        std::istringstream iss(fastqContent);
         std::string line;
         readnames.clear();
         reads.clear();
         quals.clear();
 
-        while (readnames.size() < 10000 && std::getline(file, line)) {
+        // Read entire file
+        while (std::getline(iss, line)) {
             std::string sequence, plus, quality;
 
             // Validate @readname line
             if (line.empty() || line[0] != '@') {
-                std::cerr << "Warning: Skipping malformed FASTQ entry (missing @readname)" << std::endl;
-                continue;
+                continue;  // Skip malformed entries
             }
             std::string readname = line;
 
-            if (!std::getline(file, sequence)) break;
-            if (!std::getline(file, plus)) break;
-            if (!std::getline(file, quality)) break;
-
-            // Validate FASTQ format
-            if (sequence.empty() || plus.empty() || quality.empty() ||
-                plus[0] != '+' || sequence.length() != quality.length()) {
-                std::cerr << "Warning: Skipping malformed FASTQ entry" << std::endl;
-                continue;
+            // Check if we have enough data for a complete FASTQ entry
+            if (!std::getline(iss, sequence) || 
+                !std::getline(iss, plus) || 
+                !std::getline(iss, quality) ||
+                plus.empty() || 
+                plus[0] != '+' || 
+                sequence.length() != quality.length()) {
+                break;  // Stop if we can't read a complete entry
             }
 
             readnames.push_back(readname);
@@ -177,69 +205,96 @@ public:
                    const std::string& single, 
                    const std::string& adapter, 
                    int matchLen = 8,
-                   bool gz = false) 
+                   int minLen = 0) 
         : inputFile1(in1), inputFile2(in2), 
           outputFile1(out1), outputFile2(out2), 
           singleOutputFile(single), 
           adapterSeq(adapter), 
           matchLength(matchLen),
-          gzipOutput(gz) {}
+          minReadLength(minLen) {}
 
     void process() {
-        std::ifstream file1(inputFile1);
-        std::ifstream file2(inputFile2);
-
-        if (!file1.is_open() || !file2.is_open()) {
-            std::cerr << "Error: Unable to open input files." << std::endl;
-            return;
-        }
-
         AdapterTrimmer trimmer(adapterSeq, matchLength);
         std::vector<std::string> readnames1, reads1, quals1;
         std::vector<std::string> readnames2, reads2, quals2;
 
-        while (true) {
-            reads1.clear(); reads2.clear();
-            quals1.clear(); quals2.clear();
-            readnames1.clear(); readnames2.clear();
+        // Read entire contents for both input files
+        readFastqFromString(inputFile1, readnames1, reads1, quals1);
+        readFastqFromString(inputFile2, readnames2, reads2, quals2);
 
-            readFastqFile(file1, readnames1, reads1, quals1);
-            readFastqFile(file2, readnames2, reads2, quals2);
-
-            // Ensure equal number of reads in paired files
-            if (reads1.size() != reads2.size()) {
-                std::cerr << "Warning: Unequal number of reads in paired input files!" << std::endl;
-                break;
-            }
-
-            if (reads1.empty() && reads2.empty()) break;
-
-            // Process each pair of reads
-            for (size_t i = 0; i < reads1.size(); ++i) {
-                processPair(readnames1[i], reads1[i], quals1[i], readnames2[i], reads2[i], quals2[i], trimmer);
-            }
+        // Ensure equal number of reads in paired files
+        if (reads1.size() != reads2.size()) {
+            std::cerr << "Warning: Unequal number of reads in paired input files!" << std::endl;
+            return;
         }
+
+        // Process each pair of reads
+        for (size_t i = 0; i < reads1.size(); ++i) {
+            processPair(readnames1[i], reads1[i], quals1[i], 
+                        readnames2[i], reads2[i], quals2[i], trimmer);
+        }
+        // 残りのデータをファイルにフラッシュ
+        flushBufferToFile(out1Buffer, outputFile1);
+        flushBufferToFile(out2Buffer, outputFile2);
+        flushBufferToFile(singleOutBuffer, singleOutputFile);
     }
 };
 
+// Custom wrapper functions to resolve casting issues
+namespace gzip_custom {
+    std::string decompress(const char* data, size_t size) {
+        std::string output;
+        gzip::Decompressor decomp;
+        
+        // Create a non-const copy to use with reinterpret_cast
+        std::vector<char> data_copy(data, data + size);
+        
+        decomp.decompress(output, data_copy.data(), data_copy.size());
+        return output;
+    }
+
+    std::string compress(const std::string& input) {
+        std::string output;
+        gzip::Compressor comp;
+        
+        // Create a non-const copy to use with reinterpret_cast
+        std::string input_copy = input;
+        
+        comp.compress(output, input_copy.data(), input_copy.size());
+        return output;
+    }
+}
+
 int main(int argc, char* argv[]) {
     std::string inputFile1, inputFile2, outputFile1, outputFile2, singleOutputFile, adapterSeq;
+    std::string decompressed_data1, decompressed_data2;
     int matchLength = 8;
-    bool gzipOutput = false;
+    int minReadLength = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "1:2:3:4:s:a:m:g")) != -1) {
+    while ((opt = getopt(argc, argv, "i:I:o:O:s:a:m:l:")) != -1) {
         switch (opt) {
-            case '1': inputFile1 = optarg; break;
-            case '2': inputFile2 = optarg; break;
-            case '3': outputFile1 = optarg; break;
-            case '4': outputFile2 = optarg; break;
+            case 'i': inputFile1 = optarg; break;
+            case 'I': inputFile2 = optarg; break;
+            case 'o': outputFile1 = optarg; break;
+            case 'O': outputFile2 = optarg; break;
             case 's': singleOutputFile = optarg; break;
             case 'a': adapterSeq = optarg; break;
             case 'm': matchLength = std::stoi(optarg); break;
-            case 'g': gzipOutput = true; break;
+            case 'l': minReadLength = std::stoi(optarg); break;
             default:
-                std::cerr << "Usage: " << argv[0] << " -1 input_file1 -2 input_file2 -3 output_file1 -4 output_file2 -s single_output -a adapter_seq [-m match_length]" << std::endl;
+                std::cout << "Usage: ./trimTSO [args]\n"
+                          << " required args\n"
+                          << "-i [input_forward.fastq.gz]\n"
+                          << "-I [input_reverse.fastq.gz]\n"
+                          << "-o [forward_output]\n"
+                          << "-O [reverse_output]\n"
+                          << "-s [single_output]\n"
+                          << "-a [adapter_seq]\n"
+                          << " \n"
+                          << "optional args\n"
+                          << "-m min_match_length\n"
+                          << "-l min_read_length\n";
                 return 1;
         }
     }
@@ -249,8 +304,54 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    FastqProcessor processor(inputFile1, inputFile2, outputFile1, outputFile2, singleOutputFile, adapterSeq, matchLength, gzipOutput);
+    const std::filesystem::path inputFiles[2] = {inputFile1, inputFile2};
+
+    for (int i = 0; i < 2; ++i) {
+        size_t size = std::filesystem::file_size(inputFiles[i]);
+        std::vector<char> buffer(size);
+
+        std::ifstream ifs(inputFiles[i], std::ios_base::binary);
+        ifs.read(buffer.data(), size);
+        ifs.close();
+
+        if (!gzip::is_compressed(buffer.data(), buffer.size())) {
+            std::cerr << "File " << inputFiles[i] << " is not in gzip format" << std::endl;
+            return 1;
+        }
+
+        std::string& decompressed_data = (i == 0) ? decompressed_data1 : decompressed_data2;
+        decompressed_data = gzip_custom::decompress(buffer.data(), buffer.size());
+    }
+
+    FastqProcessor processor(decompressed_data1, decompressed_data2, outputFile1, outputFile2, singleOutputFile, adapterSeq, matchLength, minReadLength);
     processor.process();
+
+    // 圧縮処理を行う関数
+    auto compressAndWrite = [](const std::string& outputFile) {
+        size_t size = std::filesystem::file_size(outputFile);
+        std::vector<char> buffer(size);
+
+        std::ifstream ifs(outputFile, std::ios_base::binary);
+        ifs.read(buffer.data(), size);
+        ifs.close();
+
+        std::string compressed_data = gzip_custom::compress(std::string(buffer.data(), size));
+
+        std::ofstream ofs(outputFile + ".fastq.gz", std::ios_base::binary);
+        ofs << compressed_data;
+        ofs.close();
+
+        std::filesystem::remove(outputFile);
+    };
+
+    // outputFile1の圧縮
+    compressAndWrite(outputFile1);
+
+    // outputFile2の圧縮
+    compressAndWrite(outputFile2);
+
+    // singleOutputFileの圧縮
+    compressAndWrite(singleOutputFile);
 
     return 0;
 }
