@@ -4,9 +4,12 @@ Library amplification using SMART-9N causes repeated insertion of TSO adapter su
 
 Compile
 
-g++ -std=c++17 trimTSO.cpp -lz -pthread -O3 -o trimTSO
+g++ -I ./ -std=c++17 trimTSOgz-modified5.cpp -lz -pthread -O3 -o trimTSOgz-modified5
 
 
 Usage
 
 ./trimTSO -1 InputF.fastq -2 InputR.fastq -3 output_F.fastq -4 output_R.fastq -s single.fastq -a AAGCAGTGGTATCAACGCAGAGTACATGGG -m 8
+
+
+gzip-hpp(https://github.com/mapbox/gzip-hpp) to decompress gz
