@@ -9,7 +9,7 @@ g++ -I ./ -std=c++17 trimTSO.cpp -lz -pthread -O3 -o trimTSO
 
 Usage
 
-./trimTSO -1 InputF.fastq -2 InputR.fastq -3 output_F.fastq -4 output_R.fastq -s single.fastq -a AAGCAGTGGTATCAACGCAGAGTACATGGG -m 8
+./trimTSO -i InputF.fastq -I InputR.fastq -o output_F.fastq -O output_R.fastq -s single.fastq -a AAGCAGTGGTATCAACGCAGAGTACATGGG [-m 8 -l 20]
 
 
 gzip-hpp(https://github.com/mapbox/gzip-hpp) to (de)compress gz
