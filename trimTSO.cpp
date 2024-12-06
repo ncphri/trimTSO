@@ -25,6 +25,7 @@ private:
 
     std::string adapter;
     int matchLength;
+    int maxMismatches;
 
     // 逆配列の作成（相補配列）
     std::string reverseComplement(const std::string& seq) {
@@ -42,9 +43,14 @@ private:
         return rc;
     }
 
+    // 塩基間の距離を計算（他と異なる場合は1、同じ場合は0）
+    int calculateDistance(char a, char b) {
+        return (a != b) ? 1 : 0;
+    }
+
 public:
-    AdapterTrimmer(const std::string& adapterSeq, int matchLen = 8)
-        : adapter(adapterSeq), matchLength(matchLen) {}
+    AdapterTrimmer(const std::string& adapterSeq, int matchLen = 8, int maxMismatchCount = 0)
+        : adapter(adapterSeq), matchLength(matchLen), maxMismatches(maxMismatchCount) {}
 
     std::pair<std::string, std::string> trimAdapters(const std::string& sequence, const std::string& quality) {
         if (sequence.empty() || quality.empty()) {
@@ -69,7 +75,7 @@ public:
     }
 
 private:
-    // 配列の前方からのトリミング
+    // 配列の前方からのトリミング（ミスマッチ許容）
     TrimmedRead forwardTrim(const std::string& sequence, const std::string& quality) {
         std::string trimmedSeq = sequence;
         std::string trimmedQual = quality;
@@ -80,7 +86,15 @@ private:
                 if (trimmedSeq.length() >= static_cast<size_t>(x)) {
                     // トリミング確認（順方向アダプター）
                     std::string adapterEnd = adapter.substr(adapter.length() - x);
-                    if (trimmedSeq.substr(0, x) == adapterEnd) {
+                    std::string toMatch = trimmedSeq.substr(0, x);
+
+                    // ミスマッチチェック
+                    int mismatches = 0;
+                    for (size_t i = 0; i < toMatch.length(); ++i) {
+                        mismatches += calculateDistance(toMatch[i], adapterEnd[i]);
+                    }
+
+                    if (mismatches <= maxMismatches) {
                         trimmedSeq = trimmedSeq.substr(x);
                         trimmedQual = trimmedQual.substr(x);
                         trimmed = true;
@@ -110,6 +124,7 @@ private:
     std::string adapterSeq;
     int matchLength;
     int minReadLength;
+    int maxMismatches;  // 新しいメンバ変数
 
     std::mutex writeMutex;
 
@@ -205,16 +220,18 @@ public:
                    const std::string& single, 
                    const std::string& adapter, 
                    int matchLen = 8,
-                   int minLen = 0) 
+                   int minLen = 0,
+                   int maxMismatchCount = 0)  // 新しいコンストラクタパラメータ 
         : inputFile1(in1), inputFile2(in2), 
           outputFile1(out1), outputFile2(out2), 
           singleOutputFile(single), 
           adapterSeq(adapter), 
           matchLength(matchLen),
-          minReadLength(minLen) {}
+          minReadLength(minLen),
+          maxMismatches(maxMismatchCount) {}  // 新しいメンバ変数の初期化
 
     void process() {
-        AdapterTrimmer trimmer(adapterSeq, matchLength);
+        AdapterTrimmer trimmer(adapterSeq, matchLength, maxMismatches);  // maxMismatchesを追加
         std::vector<std::string> readnames1, reads1, quals1;
         std::vector<std::string> readnames2, reads2, quals2;
 
@@ -270,9 +287,10 @@ int main(int argc, char* argv[]) {
     std::string decompressed_data1, decompressed_data2;
     int matchLength = 8;
     int minReadLength = 0;
+    int maxMismatches = 0;  // New parameter for mismatch tolerance
 
     int opt;
-    while ((opt = getopt(argc, argv, "i:I:o:O:s:a:m:l:")) != -1) {
+    while ((opt = getopt(argc, argv, "i:I:o:O:s:a:m:l:n:h")) != -1) {
         switch (opt) {
             case 'i': inputFile1 = optarg; break;
             case 'I': inputFile2 = optarg; break;
@@ -282,9 +300,10 @@ int main(int argc, char* argv[]) {
             case 'a': adapterSeq = optarg; break;
             case 'm': matchLength = std::stoi(optarg); break;
             case 'l': minReadLength = std::stoi(optarg); break;
-            default:
+            case 'n': maxMismatches = std::stoi(optarg); break;  // New option for mismatch tolerance
+            case 'h':
                 std::cout << "Usage: ./trimTSO [args]\n"
-                          << " required args\n"
+                          << "-------required args-------\n"
                           << "-i [input_forward.fastq.gz]\n"
                           << "-I [input_reverse.fastq.gz]\n"
                           << "-o [forward_output]\n"
@@ -292,10 +311,14 @@ int main(int argc, char* argv[]) {
                           << "-s [single_output]\n"
                           << "-a [adapter_seq]\n"
                           << " \n"
-                          << "optional args\n"
-                          << "-m min_match_length\n"
-                          << "-l min_read_length\n";
+                          << "-------optional args-------\n"
+                          << "-m min_match_length (default: 8)\n"
+                          << "-l min_read_length (default: 0)\n"
+                          << "-n max_mismatches (default: 0)\n";  // Update usage
                 return 1;
+            default:std::cout << "type -h for usage\n";
+                return 1;
+                
         }
     }
 
@@ -323,7 +346,11 @@ int main(int argc, char* argv[]) {
         decompressed_data = gzip_custom::decompress(buffer.data(), buffer.size());
     }
 
-    FastqProcessor processor(decompressed_data1, decompressed_data2, outputFile1, outputFile2, singleOutputFile, adapterSeq, matchLength, minReadLength);
+    // Modify the processor creation to pass maxMismatches
+    FastqProcessor processor(decompressed_data1, decompressed_data2, 
+                             outputFile1, outputFile2, singleOutputFile, 
+                             adapterSeq, matchLength, minReadLength, 
+                             maxMismatches);  // Add maxMismatches to constructor
     processor.process();
 
     // 圧縮処理を行う関数
