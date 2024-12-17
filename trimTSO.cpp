@@ -4,11 +4,13 @@
 #include <sstream>
 #include <vector>
 #include <string>
+#include <stdexcept>
 #include <unordered_map>
 #include <algorithm>
 #include <mutex>
 #include <getopt.h>
 #include <zlib.h>
+#include <unistd.h>
 #include <gzip/compress.hpp>
 #include <gzip/config.hpp>
 #include <gzip/decompress.hpp>
@@ -23,9 +25,10 @@ private:
         std::string quality;
     };
 
-    std::string adapter;
+    std::vector<std::string> adapterArray;
     int matchLength;
     int maxMismatches;
+    bool recurse;
 
     // 逆配列の作成（相補配列）
     std::string reverseComplement(const std::string& seq) {
@@ -49,8 +52,8 @@ private:
     }
 
 public:
-    AdapterTrimmer(const std::string& adapterSeq, int matchLen = 8, int maxMismatchCount = 0)
-        : adapter(adapterSeq), matchLength(matchLen), maxMismatches(maxMismatchCount) {}
+    AdapterTrimmer(const std::vector<std::string>& adapterSeqs, int matchLen = 8, int maxMismatchCount = 0, bool rc = false)
+        : adapterArray(adapterSeqs), matchLength(matchLen), maxMismatches(maxMismatchCount), recurse(rc) {}
 
     std::pair<std::string, std::string> trimAdapters(const std::string& sequence, const std::string& quality) {
         if (sequence.empty() || quality.empty()) {
@@ -80,29 +83,34 @@ private:
         std::string trimmedSeq = sequence;
         std::string trimmedQual = quality;
         bool trimmed = true;
-        while (trimmed && trimmedSeq.length() >= static_cast<size_t>(matchLength)) {
-            trimmed = false;
-            for (int x = matchLength; x <= static_cast<int>(adapter.length()); ++x) {
-                if (trimmedSeq.length() >= static_cast<size_t>(x)) {
-                    // トリミング確認（順方向アダプター）
-                    std::string adapterEnd = adapter.substr(adapter.length() - x);
-                    std::string toMatch = trimmedSeq.substr(0, x);
+        for (const auto& adapter : adapterArray) {
+    trimmed = true;  // adapterごとにトリミングを再度有効にする
+    while (trimmed && trimmedSeq.length() >= static_cast<size_t>(matchLength)) {
+        trimmed = false;  // ここで false にリセットする
+        for (int x = static_cast<int>(adapter.length()); x >= matchLength; --x) {
+            if (trimmedSeq.length() >= static_cast<size_t>(x)) {
+                // トリミング確認（順方向アダプター）
+                std::string adapterEnd = adapter.substr(adapter.length() - x);
+                std::string toMatch = trimmedSeq.substr(0, x);
 
-                    // ミスマッチチェック
-                    int mismatches = 0;
-                    for (size_t i = 0; i < toMatch.length(); ++i) {
-                        mismatches += calculateDistance(toMatch[i], adapterEnd[i]);
-                    }
+                // ミスマッチチェック
+                int mismatches = 0;
+                for (size_t i = 0; i < toMatch.length(); ++i) {
+                    mismatches += calculateDistance(toMatch[i], adapterEnd[i]);
+                }
 
-                    if (mismatches <= maxMismatches) {
-                        trimmedSeq = trimmedSeq.substr(x);
-                        trimmedQual = trimmedQual.substr(x);
+                if (mismatches <= maxMismatches) {
+                    trimmedSeq = trimmedSeq.substr(x);
+                    trimmedQual = trimmedQual.substr(x);
+                    if (recurse == true) {
                         trimmed = true;
-                        break;
                     }
+                    break;  // 現在のadapterで一致したのでbreak
                 }
             }
         }
+    }
+}
         return {trimmedSeq, trimmedQual};
     }
 
@@ -121,10 +129,11 @@ private:
     std::string outputFile1;
     std::string outputFile2;
     std::string singleOutputFile;
-    std::string adapterSeq;
+    std::vector<std::string> adapterArray;
     int matchLength;
     int minReadLength;
-    int maxMismatches;  // 新しいメンバ変数
+    int maxMismatches;
+    bool recurse;  // 新しいメンバ変数
 
     std::mutex writeMutex;
 
@@ -218,20 +227,22 @@ public:
     FastqProcessor(const std::string& in1, const std::string& in2,
                    const std::string& out1, const std::string& out2,
                    const std::string& single, 
-                   const std::string& adapter, 
+                   const std::vector<std::string>& adapterSeqs, 
                    int matchLen = 8,
                    int minLen = 0,
-                   int maxMismatchCount = 0)  // 新しいコンストラクタパラメータ 
+                   int maxMismatchCount = 0,
+                   bool rc = false)  // 新しいコンストラクタパラメータ 
         : inputFile1(in1), inputFile2(in2), 
           outputFile1(out1), outputFile2(out2), 
           singleOutputFile(single), 
-          adapterSeq(adapter), 
+          adapterArray(adapterSeqs), 
           matchLength(matchLen),
           minReadLength(minLen),
-          maxMismatches(maxMismatchCount) {}  // 新しいメンバ変数の初期化
+          maxMismatches(maxMismatchCount),
+          recurse(rc) {}  // 新しいメンバ変数の初期化
 
     void process() {
-        AdapterTrimmer trimmer(adapterSeq, matchLength, maxMismatches);  // maxMismatchesを追加
+        AdapterTrimmer trimmer(adapterArray, matchLength, maxMismatches, recurse);  // maxMismatchesを追加
         std::vector<std::string> readnames1, reads1, quals1;
         std::vector<std::string> readnames2, reads2, quals2;
 
@@ -282,76 +293,212 @@ namespace gzip_custom {
     }
 }
 
+// Custom function to read multi-FASTA file
+std::vector<std::string> readAdaptersFromFASTA(const std::string& filename) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        throw std::runtime_error("Could not open adapter file: " + filename);
+    }
+
+    std::vector<std::string> adapters;
+    std::string line, currentSequence;
+    bool inSequence = false;
+
+    while (std::getline(file, line)) {
+        // Trim whitespace
+        line.erase(0, line.find_first_not_of(" \t\r\n"));
+        line.erase(line.find_last_not_of(" \t\r\n") + 1);
+
+        if (line.empty()) continue;
+
+        // Check if this is a header line
+        if (line[0] == '>') {
+            // If we were previously building a sequence, add it to adapters
+            if (!currentSequence.empty()) {
+                // Remove any whitespace from the sequence
+                currentSequence.erase(
+                    std::remove_if(currentSequence.begin(), currentSequence.end(), ::isspace), 
+                    currentSequence.end()
+                );
+                adapters.push_back(currentSequence);
+                currentSequence.clear();
+            }
+            inSequence = true;
+            continue;
+        }
+
+        // If we're in a sequence section, accumulate the sequence
+        if (inSequence) {
+            currentSequence += line;
+        }
+    }
+
+    // Add the last sequence if not empty
+    if (!currentSequence.empty()) {
+        // Remove any whitespace from the sequence
+        currentSequence.erase(
+            std::remove_if(currentSequence.begin(), currentSequence.end(), ::isspace), 
+            currentSequence.end()
+        );
+        adapters.push_back(currentSequence);
+    }
+
+    return adapters;
+}
+
 int main(int argc, char* argv[]) {
-    std::string inputFile1, inputFile2, outputFile1, outputFile2, singleOutputFile, adapterSeq;
+    std::string inputFile1, inputFile2, outputFile1, outputFile2, singleOutputFile, adapterFile;
     std::string decompressed_data1, decompressed_data2;
     int matchLength = 8;
     int minReadLength = 0;
-    int maxMismatches = 0;  // New parameter for mismatch tolerance
+    int maxMismatches = 0;
+    bool recurse = false;  // New flag for recursive processing
+    bool gzipout = false;
+    std::vector<std::string> adapterArray;
 
     int opt;
-    while ((opt = getopt(argc, argv, "i:I:o:O:s:a:m:l:n:h")) != -1) {
+    while ((opt = getopt(argc, argv, "i:I:o:O:s:f:m:l:n:rgh")) != -1) {
         switch (opt) {
-            case 'i': inputFile1 = optarg; break;
-            case 'I': inputFile2 = optarg; break;
-            case 'o': outputFile1 = optarg; break;
-            case 'O': outputFile2 = optarg; break;
-            case 's': singleOutputFile = optarg; break;
-            case 'a': adapterSeq = optarg; break;
-            case 'm': matchLength = std::stoi(optarg); break;
-            case 'l': minReadLength = std::stoi(optarg); break;
-            case 'n': maxMismatches = std::stoi(optarg); break;  // New option for mismatch tolerance
+            case 'i':
+                inputFile1 = optarg;
+                break;
+            case 'I':
+                inputFile2 = optarg;
+                break;
+            case 'o':
+                outputFile1 = optarg;
+                break;
+            case 'O':
+                outputFile2 = optarg;
+                break;
+            case 's':
+                singleOutputFile = optarg;
+                break;
+            case 'f':
+                adapterFile = optarg;
+                break;
+            case 'm':
+                matchLength = std::stoi(optarg);
+                break;
+            case 'l':
+                minReadLength = std::stoi(optarg);
+                break;
+            case 'n':
+                maxMismatches = std::stoi(optarg);
+                break;
+            case 'r':
+                recurse = true;
+                break;
+            case 'g':
+                gzipout = true;
+                break;
             case 'h':
                 std::cout << "Usage: ./trimTSO [args]\n"
                           << "-------required args-------\n"
-                          << "-i [input_forward.fastq.gz]\n"
-                          << "-I [input_reverse.fastq.gz]\n"
+                          << "-i [input_forward.fastq(.gz)]\n"
+                          << "-I [input_reverse.fastq(.gz)]\n"
                           << "-o [forward_output]\n"
                           << "-O [reverse_output]\n"
                           << "-s [single_output]\n"
-                          << "-a [adapter_seq]\n"
+                          << "-f [adapterfile(multiFASTA)]\n"
                           << " \n"
                           << "-------optional args-------\n"
                           << "-m min_match_length (default: 8)\n"
                           << "-l min_read_length (default: 0)\n"
-                          << "-n max_mismatches (default: 0)\n";  // Update usage
+                          << "-n max_mismatches (default: 0)\n"
+                          << "-r trim recursively (only for SMART-adapter trim; default: false)\n"
+                          << "-g gzip output (default: false)\n";  // Update usage
                 return 1;
-            default:std::cout << "type -h for usage\n";
+            default:
+                std::cerr << "Unknown option: " << char(opt) << "\n";
                 return 1;
-                
         }
     }
 
-    if (inputFile1.empty() || inputFile2.empty() || outputFile1.empty() || outputFile2.empty() || singleOutputFile.empty() || adapterSeq.empty()) {
+    
+
+    if (inputFile1.empty() || inputFile2.empty() || outputFile1.empty() || 
+        outputFile2.empty() || singleOutputFile.empty() || adapterFile.empty()) {
         std::cerr << "Error: Missing required arguments." << std::endl;
         return 1;
+    }
+    outputFile1 = outputFile1 + ".fastq";
+    outputFile2 = outputFile2 + ".fastq";
+    singleOutputFile = singleOutputFile + ".fastq";
+
+    // 確認用の出力
+    std::cout << "Final Values:\n";
+    std::cout << "inputFile1: " << inputFile1 << "\n";
+    std::cout << "inputFile2: " << inputFile2 << "\n";
+    std::cout << "outputFile1: " << outputFile1 << "\n";
+    std::cout << "outputFile2: " << outputFile2 << "\n";
+    std::cout << "singleOutputFile: " << singleOutputFile << "\n";
+    std::cout << "adapterFile: " << adapterFile << "\n";
+    std::cout << "matchLength: " << matchLength << "\n";
+    std::cout << "minReadLength: " << minReadLength << "\n";
+    std::cout << "maxMismatches: " << maxMismatches << "\n";
+    std::cout << "recurse: " << (recurse ? "true" : "false") << "\n";
+    std::cout << "gzipout: " << (gzipout ? "true" : "false") << "\n";
+
+
+    // Read adapter sequences from multi-FASTA file
+    try {
+        adapterArray = readAdaptersFromFASTA(adapterFile);
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << std::endl;
+        return 1;
+    }
+
+    // Verify at least one adapter was read
+    if (adapterArray.empty()) {
+        std::cerr << "Error: No adapter sequences found in the input file." << std::endl;
+        return 1;
+    }
+
+    // Print out the adapter sequences (for debugging/verification)
+    std::cout << "Loaded " << adapterArray.size() << " adapter sequences:" << std::endl;
+    for (const auto& adapter : adapterArray) {
+        std::cout << adapter << std::endl;
     }
 
     const std::filesystem::path inputFiles[2] = {inputFile1, inputFile2};
 
-    for (int i = 0; i < 2; ++i) {
-        size_t size = std::filesystem::file_size(inputFiles[i]);
-        std::vector<char> buffer(size);
+for (int i = 0; i < 2; ++i) {
+    size_t size = std::filesystem::file_size(inputFiles[i]);
+    std::vector<char> buffer(size);
 
-        std::ifstream ifs(inputFiles[i], std::ios_base::binary);
-        ifs.read(buffer.data(), size);
-        ifs.close();
-
-        if (!gzip::is_compressed(buffer.data(), buffer.size())) {
-            std::cerr << "File " << inputFiles[i] << " is not in gzip format" << std::endl;
-            return 1;
-        }
-
-        std::string& decompressed_data = (i == 0) ? decompressed_data1 : decompressed_data2;
-        decompressed_data = gzip_custom::decompress(buffer.data(), buffer.size());
+    // ファイルをバイナリモードで読み込む
+    std::ifstream ifs(inputFiles[i], std::ios_base::binary);
+    if (!ifs) {
+        std::cerr << "Failed to open file: " << inputFiles[i] << std::endl;
+        return 1;
     }
+    ifs.read(buffer.data(), size);
+    ifs.close();
+
+    // 解凍結果を格納する変数
+    std::string& decompressed_data = (i == 0) ? decompressed_data1 : decompressed_data2;
+
+    // gzip圧縮されているか判定
+    if (gzip::is_compressed(buffer.data(), buffer.size())) {
+        std::cout << "File " << inputFiles[i] << " is gzip-compressed. Decompressing..." << std::endl;
+        decompressed_data = gzip_custom::decompress(buffer.data(), buffer.size());
+        std::cout << "decompressed" << std::endl;
+    } else {
+        std::cout << "File " << inputFiles[i] << " is not gzip-compressed. Reading as is..." << std::endl;
+        decompressed_data.assign(buffer.begin(), buffer.end());  // そのまま読み込み
+        std::cout << "done" << std::endl;
+    }
+}
 
     // Modify the processor creation to pass maxMismatches
+    std::cout << "Processing..." << std::endl;
     FastqProcessor processor(decompressed_data1, decompressed_data2, 
                              outputFile1, outputFile2, singleOutputFile, 
-                             adapterSeq, matchLength, minReadLength, 
-                             maxMismatches);  // Add maxMismatches to constructor
+                             adapterArray, matchLength, minReadLength, 
+                             maxMismatches, recurse);  // Add maxMismatches to constructor
     processor.process();
+    std::cout << "Completed" << std::endl;
 
     // 圧縮処理を行う関数
     auto compressAndWrite = [](const std::string& outputFile) {
@@ -364,21 +511,24 @@ int main(int argc, char* argv[]) {
 
         std::string compressed_data = gzip_custom::compress(std::string(buffer.data(), size));
 
-        std::ofstream ofs(outputFile + ".fastq.gz", std::ios_base::binary);
+        std::ofstream ofs(outputFile + ".gz", std::ios_base::binary);
         ofs << compressed_data;
         ofs.close();
 
         std::filesystem::remove(outputFile);
     };
+    
+    if (gzipout == true) {
+        std::cout << "Compressing output files" << std::endl;
+        // outputFile1の圧縮
+        compressAndWrite(outputFile1);
 
-    // outputFile1の圧縮
-    compressAndWrite(outputFile1);
+        // outputFile2の圧縮
+        compressAndWrite(outputFile2);
 
-    // outputFile2の圧縮
-    compressAndWrite(outputFile2);
-
-    // singleOutputFileの圧縮
-    compressAndWrite(singleOutputFile);
+        // singleOutputFileの圧縮
+        compressAndWrite(singleOutputFile);
+    }
 
     return 0;
 }
