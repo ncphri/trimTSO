@@ -1,4 +1,5 @@
 Library amplification using SMART-9N causes repeated insertion of TSO adapter subsequences at the read ends. This tool specifically recognizes the adapter sequence from each read end and removes it, including the repeated adapter subsequences.
+
 This tool is also useful for adapter/primer trimming as it recognizes and trims adapter sequences from the read ends.
 
 
