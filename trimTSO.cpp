@@ -28,6 +28,7 @@ private:
     std::vector<std::string> adapterArray;
     int matchLength;
     int maxMismatches;
+    int maxMismatchCost;
     bool recurse;
 
     // 逆配列の作成（相補配列）
@@ -47,13 +48,40 @@ private:
     }
 
     // 塩基間の距離を計算（他と異なる場合は1、同じ場合は0）
-    int calculateDistance(char a, char b) {
-        return (a != b) ? 1 : 0;
+    int calculateBaseDistance(char base1, char base2) {
+        // 塩基が異なる場合は1、同じ場合は0を返す
+        return (base1 != base2) ? 1 : 0;
+    }
+
+    int calculateEditDistance(const std::string& seq1, const std::string& seq2) {
+        size_t len1 = seq1.length();
+        size_t len2 = seq2.length();
+    
+        // DPテーブルを初期化
+        std::vector<std::vector<int>> dp(len1 + 1, std::vector<int>(len2 + 1, 0));
+    
+        // 初期条件：空文字列への変換コスト
+        for (size_t i = 0; i <= len1; ++i) dp[i][0] = i; // デリーション
+        for (size_t j = 0; j <= len2; ++j) dp[0][j] = j; // インサーション
+    
+        // DPテーブルの更新
+        for (size_t i = 1; i <= len1; ++i) {
+            for (size_t j = 1; j <= len2; ++j) {
+                int cost = calculateBaseDistance(seq1[i - 1], seq2[j - 1]); // ミスマッチコスト
+                dp[i][j] = std::min({ 
+                    dp[i - 1][j] + 1,     // デリーション（seq1の1文字を削除）
+                    dp[i][j - 1] + 1,      // インサーション（seq2に1文字挿入）
+                    dp[i - 1][j - 1] + cost // 置換（ミスマッチなら1, 一致なら0）
+                });
+            }
+        }
+    
+        return dp[len1][len2]; // 編集距離を返す
     }
 
 public:
-    AdapterTrimmer(const std::vector<std::string>& adapterSeqs, int matchLen = 8, int maxMismatchCount = 0, bool rc = false)
-        : adapterArray(adapterSeqs), matchLength(matchLen), maxMismatches(maxMismatchCount), recurse(rc) {}
+    AdapterTrimmer(const std::vector<std::string>& adapterSeqs, int matchLen = 8, int maxMismatchCount = 0, int maxCosts = 0, bool rc = false)
+        : adapterArray(adapterSeqs), matchLength(matchLen), maxMismatches(maxMismatchCount), maxMismatchCost(maxCosts), recurse(rc) {}
 
     std::pair<std::string, std::string> trimAdapters(const std::string& sequence, const std::string& quality) {
         if (sequence.empty() || quality.empty()) {
@@ -95,17 +123,34 @@ private:
 
                 // ミスマッチチェック
                 int mismatches = 0;
-                for (size_t i = 0; i < toMatch.length(); ++i) {
-                    mismatches += calculateDistance(toMatch[i], adapterEnd[i]);
+                if (maxMismatchCost > 0){
+                    mismatches = calculateEditDistance(adapterEnd, toMatch);
                 }
-
-                if (mismatches <= maxMismatches) {
-                    trimmedSeq = trimmedSeq.substr(x);
-                    trimmedQual = trimmedQual.substr(x);
-                    if (recurse == true) {
-                        trimmed = true;
+                else{
+                    for (size_t i = 0; i < toMatch.length(); ++i) {
+                    mismatches += calculateBaseDistance(toMatch[i], adapterEnd[i]);
                     }
-                    break;  // 現在のadapterで一致したのでbreak
+                }
+                
+                if (maxMismatchCost > 0){
+                    if (mismatches <= maxMismatchCost) {
+                        trimmedSeq = trimmedSeq.substr(x);
+                        trimmedQual = trimmedQual.substr(x);
+                        if (recurse == true) {
+                            trimmed = true;
+                        }
+                        break;  // 現在のadapterで一致したのでbreak
+                    }
+                }
+                else{
+                    if (mismatches <= maxMismatches) {
+                        trimmedSeq = trimmedSeq.substr(x);
+                        trimmedQual = trimmedQual.substr(x);
+                        if (recurse == true) {
+                            trimmed = true;
+                        }
+                        break;  // 現在のadapterで一致したのでbreak
+                    }
                 }
             }
         }
@@ -133,6 +178,7 @@ private:
     int matchLength;
     int minReadLength;
     int maxMismatches;
+    int maxMismatchCost;
     bool recurse;  // 新しいメンバ変数
 
     std::mutex writeMutex;
@@ -231,6 +277,7 @@ public:
                    int matchLen = 8,
                    int minLen = 0,
                    int maxMismatchCount = 0,
+                   int maxCosts = 0,
                    bool rc = false)  // 新しいコンストラクタパラメータ 
         : inputFile1(in1), inputFile2(in2), 
           outputFile1(out1), outputFile2(out2), 
@@ -239,10 +286,11 @@ public:
           matchLength(matchLen),
           minReadLength(minLen),
           maxMismatches(maxMismatchCount),
+          maxMismatchCost(maxCosts),
           recurse(rc) {}  // 新しいメンバ変数の初期化
 
     void process() {
-        AdapterTrimmer trimmer(adapterArray, matchLength, maxMismatches, recurse);  // maxMismatchesを追加
+        AdapterTrimmer trimmer(adapterArray, matchLength, maxMismatches, maxMismatchCost, recurse);  // maxMismatchesを追加
         std::vector<std::string> readnames1, reads1, quals1;
         std::vector<std::string> readnames2, reads2, quals2;
 
@@ -352,12 +400,13 @@ int main(int argc, char* argv[]) {
     int matchLength = 8;
     int minReadLength = 0;
     int maxMismatches = 0;
+    int maxMismatchCost = 0;
     bool recurse = false;  // New flag for recursive processing
     bool gzipout = false;
     std::vector<std::string> adapterArray;
 
     int opt;
-    while ((opt = getopt(argc, argv, "i:I:o:O:s:f:m:l:n:rgh")) != -1) {
+    while ((opt = getopt(argc, argv, "i:I:o:O:s:f:m:l:n:c:rgh")) != -1) {
         switch (opt) {
             case 'i':
                 inputFile1 = optarg;
@@ -386,6 +435,9 @@ int main(int argc, char* argv[]) {
             case 'n':
                 maxMismatches = std::stoi(optarg);
                 break;
+            case 'c':
+                maxMismatchCost = std::stoi(optarg);
+                break;
             case 'r':
                 recurse = true;
                 break;
@@ -405,8 +457,9 @@ int main(int argc, char* argv[]) {
                           << "-------optional args-------\n"
                           << "-m min_match_length (default: 8)\n"
                           << "-l min_read_length (default: 0)\n"
-                          << "-n max_mismatches (default: 0)\n"
-                          << "-r trim recursively (only for SMART-adapter trim; default: false)\n"
+                          << "-n max_mismatches_count (default: 0)\n"
+                          << "-c max_mismatch_cost (This option increases computation time; default: 0)\n"
+                          << "-r trim recursively (only recommended for SMART-adapter trim; default: false)\n"
                           << "-g gzip output (default: false)\n";  // Update usage
                 return 1;
             default:
@@ -436,7 +489,12 @@ int main(int argc, char* argv[]) {
     std::cout << "adapterFile: " << adapterFile << "\n";
     std::cout << "matchLength: " << matchLength << "\n";
     std::cout << "minReadLength: " << minReadLength << "\n";
-    std::cout << "maxMismatches: " << maxMismatches << "\n";
+    if (maxMismatchCost > 0){
+        std::cout << "maxMismatchCost: " << maxMismatchCost << "\n";
+    }
+    else{
+        std::cout << "maxMismatches: " << maxMismatches << "\n";
+    }
     std::cout << "recurse: " << (recurse ? "true" : "false") << "\n";
     std::cout << "gzipout: " << (gzipout ? "true" : "false") << "\n";
 
@@ -496,7 +554,7 @@ for (int i = 0; i < 2; ++i) {
     FastqProcessor processor(decompressed_data1, decompressed_data2, 
                              outputFile1, outputFile2, singleOutputFile, 
                              adapterArray, matchLength, minReadLength, 
-                             maxMismatches, recurse);  // Add maxMismatches to constructor
+                             maxMismatches, maxMismatchCost, recurse);  // Add maxMismatches to constructor
     processor.process();
     std::cout << "Completed" << std::endl;
 
