@@ -1,22 +1,3 @@
-#include <iostream>
-#include <fstream>
-#include <filesystem>
-#include <sstream>
-#include <vector>
-#include <string>
-#include <stdexcept>
-#include <unordered_map>
-#include <algorithm>
-#include <mutex>
-#include <getopt.h>
-#include <zlib.h>
-#include <unistd.h>
-#include <gzip/compress.hpp>
-#include <gzip/config.hpp>
-#include <gzip/decompress.hpp>
-#include <gzip/utils.hpp>
-#include <gzip/version.hpp>
-
 class AdapterTrimmer {
 private:
     // Define TrimmedRead at the class level
@@ -179,21 +160,38 @@ private:
     int minReadLength;
     int maxMismatches;
     int maxMismatchCost;
-    bool recurse;  // 新しいメンバ変数
+    bool recurse;
+    bool isPaired;  // New flag to indicate if processing paired-end data
 
     std::mutex writeMutex;
 
-    // バッファ用メンバ変数
+    // Buffer variables
     std::string out1Buffer;
     std::string out2Buffer;
     std::string singleOutBuffer;
     const size_t bufferLimit = 10 * 1024 * 1024; // 10MB
 
-    // バッファをファイルに書き込む関数
     void flushBufferToFile(const std::string& buffer, const std::string& fileName) {
         if (!buffer.empty()) {
             std::ofstream file(fileName, std::ios_base::app);
             file << buffer;
+        }
+    }
+
+    // New method for processing single reads
+    void processSingleRead(const std::string& readname, const std::string& read,
+                          const std::string& qual, AdapterTrimmer& trimmer) {
+        auto [trimmedSeq, trimmedQual] = trimmer.trimAdapters(read, qual);
+
+        std::lock_guard<std::mutex> lock(writeMutex);
+
+        if (trimmedSeq.size() >= static_cast<size_t>(minReadLength)) {
+            out1Buffer += readname + "\n" + trimmedSeq + "\n+\n" + trimmedQual + "\n";
+
+            if (out1Buffer.size() >= bufferLimit) {
+                flushBufferToFile(out1Buffer, outputFile1);
+                out1Buffer.clear();
+            }
         }
     }
 
@@ -206,19 +204,17 @@ private:
 
         std::lock_guard<std::mutex> lock(writeMutex);
 
-        if (trimmedSeq1.size() >= static_cast<size_t>(minReadLength) && trimmedSeq2.size() >= static_cast<size_t>(minReadLength)) {
-            // 両リードがトリム可能
+        if (trimmedSeq1.size() >= static_cast<size_t>(minReadLength) && 
+            trimmedSeq2.size() >= static_cast<size_t>(minReadLength)) {
             out1Buffer += readname1 + "\n" + trimmedSeq1 + "\n+\n" + trimmedQual1 + "\n";
             out2Buffer += readname2 + "\n" + trimmedSeq2 + "\n+\n" + trimmedQual2 + "\n";
         } else if (trimmedSeq1.size() >= static_cast<size_t>(minReadLength)) {
-            // read1のみトリム可能
             singleOutBuffer += readname1 + "\n" + trimmedSeq1 + "\n+\n" + trimmedQual1 + "\n";
         } else if (trimmedSeq2.size() >= static_cast<size_t>(minReadLength)) {
-            // read2のみトリム可能
             singleOutBuffer += readname2 + "\n" + trimmedSeq2 + "\n+\n" + trimmedQual2 + "\n";
         }
 
-        // 一定サイズを超えたらバッファをフラッシュ
+        // Buffer management
         if (out1Buffer.size() >= bufferLimit) {
             flushBufferToFile(out1Buffer, outputFile1);
             out1Buffer.clear();
@@ -278,7 +274,7 @@ public:
                    int minLen = 0,
                    int maxMismatchCount = 0,
                    int maxCosts = 0,
-                   bool rc = false)  // 新しいコンストラクタパラメータ 
+                   bool rc = false)
         : inputFile1(in1), inputFile2(in2), 
           outputFile1(out1), outputFile2(out2), 
           singleOutputFile(single), 
@@ -287,32 +283,44 @@ public:
           minReadLength(minLen),
           maxMismatches(maxMismatchCount),
           maxMismatchCost(maxCosts),
-          recurse(rc) {}  // 新しいメンバ変数の初期化
+          recurse(rc),
+          isPaired(!in2.empty()) {}
 
     void process() {
-        AdapterTrimmer trimmer(adapterArray, matchLength, maxMismatches, maxMismatchCost, recurse);  // maxMismatchesを追加
+        AdapterTrimmer trimmer(adapterArray, matchLength, maxMismatches, maxMismatchCost, recurse);
         std::vector<std::string> readnames1, reads1, quals1;
         std::vector<std::string> readnames2, reads2, quals2;
 
-        // Read entire contents for both input files
+        // Read first input file
         readFastqFromString(inputFile1, readnames1, reads1, quals1);
-        readFastqFromString(inputFile2, readnames2, reads2, quals2);
 
-        // Ensure equal number of reads in paired files
-        if (reads1.size() != reads2.size()) {
-            std::cerr << "Warning: Unequal number of reads in paired input files!" << std::endl;
-            return;
-        }
+        if (isPaired) {
+            // Process paired-end data
+            readFastqFromString(inputFile2, readnames2, reads2, quals2);
 
-        // Process each pair of reads
-        for (size_t i = 0; i < reads1.size(); ++i) {
-            processPair(readnames1[i], reads1[i], quals1[i], 
-                        readnames2[i], reads2[i], quals2[i], trimmer);
+            if (reads1.size() != reads2.size()) {
+                std::cerr << "Warning: Unequal number of reads in paired input files!" << std::endl;
+                return;
+            }
+
+            for (size_t i = 0; i < reads1.size(); ++i) {
+                processPair(readnames1[i], reads1[i], quals1[i], 
+                           readnames2[i], reads2[i], quals2[i], trimmer);
+            }
+
+            // Flush remaining paired-end data
+            flushBufferToFile(out1Buffer, outputFile1);
+            flushBufferToFile(out2Buffer, outputFile2);
+            flushBufferToFile(singleOutBuffer, singleOutputFile);
+        } else {
+            // Process single-end data
+            for (size_t i = 0; i < reads1.size(); ++i) {
+                processSingleRead(readnames1[i], reads1[i], quals1[i], trimmer);
+            }
+
+            // Flush remaining single-end data
+            flushBufferToFile(out1Buffer, outputFile1);
         }
-        // 残りのデータをファイルにフラッシュ
-        flushBufferToFile(out1Buffer, outputFile1);
-        flushBufferToFile(out2Buffer, outputFile2);
-        flushBufferToFile(singleOutBuffer, singleOutputFile);
     }
 };
 
@@ -394,6 +402,7 @@ std::vector<std::string> readAdaptersFromFASTA(const std::string& filename) {
     return adapters;
 }
 
+// Main function modifications
 int main(int argc, char* argv[]) {
     std::string inputFile1, inputFile2, outputFile1, outputFile2, singleOutputFile, adapterFile;
     std::string decompressed_data1, decompressed_data2;
@@ -401,7 +410,7 @@ int main(int argc, char* argv[]) {
     int minReadLength = 0;
     int maxMismatches = 0;
     int maxMismatchCost = 0;
-    bool recurse = false;  // New flag for recursive processing
+    bool recurse = false;
     bool gzipout = false;
     std::vector<std::string> adapterArray;
 
@@ -447,20 +456,20 @@ int main(int argc, char* argv[]) {
             case 'h':
                 std::cout << "Usage: ./trimTSO [args]\n"
                           << "-------required args-------\n"
-                          << "-i [input_forward.fastq(.gz)]\n"
-                          << "-I [input_reverse.fastq(.gz)]\n"
-                          << "-o [forward_output]\n"
-                          << "-O [reverse_output]\n"
-                          << "-s [single_output]\n"
+                          << "-i [input.fastq(.gz)]\n"
+                          << "-o [output]\n"
                           << "-f [adapterfile(multiFASTA)]\n"
-                          << " \n"
+                          << "\n"
                           << "-------optional args-------\n"
+                          << "-I [input_reverse.fastq(.gz)] (for paired-end data)\n"
+                          << "-O [reverse_output] (required if -I is specified)\n"
+                          << "-s [single_output] (required for paired-end data)\n"
                           << "-m min_match_length (default: 8)\n"
                           << "-l min_read_length (default: 0)\n"
                           << "-n max_mismatches_count (default: 0)\n"
-                          << "-c max_mismatch_cost (This option increases computation time; default: 0)\n"
-                          << "-r trim recursively (only recommended for SMART-adapter trim; default: false)\n"
-                          << "-g gzip output (default: false)\n";  // Update usage
+                          << "-c max_mismatch_cost (increases computation time; default: 0)\n"
+                          << "-r trim recursively (only for SMART-adapter trim; default: false)\n"
+                          << "-g gzip output (default: false)\n";
                 return 1;
             default:
                 std::cerr << "Unknown option: " << char(opt) << "\n";
@@ -468,36 +477,49 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    
-
-    if (inputFile1.empty() || inputFile2.empty() || outputFile1.empty() || 
-        outputFile2.empty() || singleOutputFile.empty() || adapterFile.empty()) {
-        std::cerr << "Error: Missing required arguments." << std::endl;
+    // Validate required arguments
+    if (inputFile1.empty() || outputFile1.empty() || adapterFile.empty()) {
+        std::cerr << "Error: Missing required arguments (-i, -o, -f)" << std::endl;
         return 1;
     }
+
+    // Validate paired-end arguments
+    if (!inputFile2.empty() && outputFile2.empty()) {
+        std::cerr << "Error: -O (reverse output) is required when -I is specified" << std::endl;
+        return 1;
+    }
+
+    if (!inputFile2.empty() && singleOutputFile.empty()) {
+        std::cerr << "Error: -s (single output) is required for paired-end data" << std::endl;
+        return 1;
+    }
+
+    // Add .fastq extension to output files
     outputFile1 = outputFile1 + ".fastq";
-    outputFile2 = outputFile2 + ".fastq";
-    singleOutputFile = singleOutputFile + ".fastq";
-
-    // 確認用の出力
-    std::cout << "Final Values:\n";
-    std::cout << "inputFile1: " << inputFile1 << "\n";
-    std::cout << "inputFile2: " << inputFile2 << "\n";
-    std::cout << "outputFile1: " << outputFile1 << "\n";
-    std::cout << "outputFile2: " << outputFile2 << "\n";
-    std::cout << "singleOutputFile: " << singleOutputFile << "\n";
-    std::cout << "adapterFile: " << adapterFile << "\n";
-    std::cout << "matchLength: " << matchLength << "\n";
-    std::cout << "minReadLength: " << minReadLength << "\n";
-    if (maxMismatchCost > 0){
-        std::cout << "maxMismatchCost: " << maxMismatchCost << "\n";
+    if (!outputFile2.empty()) {
+        outputFile2 = outputFile2 + ".fastq";
+        singleOutputFile = singleOutputFile + ".fastq";
     }
-    else{
-        std::cout << "maxMismatches: " << maxMismatches << "\n";
-    }
-    std::cout << "recurse: " << (recurse ? "true" : "false") << "\n";
-    std::cout << "gzipout: " << (gzipout ? "true" : "false") << "\n";
 
+    // Print configuration
+    std::cout << "Configuration:\n"
+              << "Input file 1: " << inputFile1 << "\n";
+    if (!inputFile2.empty()) {
+        std::cout << "Input file 2: " << inputFile2 << "\n"
+                  << "Output file 2: " << outputFile2 << "\n"
+                  << "Single output: " << singleOutputFile << "\n";
+    }
+    std::cout << "Output file 1: " << outputFile1 << "\n"
+              << "Adapter file: " << adapterFile << "\n"
+              << "Match length: " << matchLength << "\n"
+              << "Min read length: " << minReadLength << "\n";
+    if (maxMismatchCost > 0) {
+        std::cout << "Max mismatch cost: " << maxMismatchCost << "\n";
+    } else {
+        std::cout << "Max mismatches: " << maxMismatches << "\n";
+    }
+    std::cout << "Recursive: " << (recurse ? "true" : "false") << "\n"
+              << "Gzip output: " << (gzipout ? "true" : "false") << "\n";
 
     // Read adapter sequences from multi-FASTA file
     try {
@@ -519,9 +541,11 @@ int main(int argc, char* argv[]) {
         std::cout << adapter << std::endl;
     }
 
-    const std::filesystem::path inputFiles[2] = {inputFile1, inputFile2};
+// 入力ファイルを処理する部分を修正
+int numFiles = inputFile2.empty() ? 1 : 2;  // 処理するファイル数を決定
+const std::filesystem::path inputFiles[2] = {inputFile1, inputFile2};
 
-for (int i = 0; i < 2; ++i) {
+for (int i = 0; i < numFiles; ++i) {
     size_t size = std::filesystem::file_size(inputFiles[i]);
     std::vector<char> buffer(size);
 
