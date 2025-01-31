@@ -1,3 +1,22 @@
+#include <iostream>
+#include <fstream>
+#include <filesystem>
+#include <sstream>
+#include <vector>
+#include <string>
+#include <stdexcept>
+#include <unordered_map>
+#include <algorithm>
+#include <mutex>
+#include <getopt.h>
+#include <zlib.h>
+#include <unistd.h>
+#include <gzip/compress.hpp>
+#include <gzip/config.hpp>
+#include <gzip/decompress.hpp>
+#include <gzip/utils.hpp>
+#include <gzip/version.hpp>
+
 class AdapterTrimmer {
 private:
     // Define TrimmedRead at the class level
