@@ -17,7 +17,7 @@ class Compressor
 
   public:
     Compressor(int level = Z_DEFAULT_COMPRESSION,
-               std::size_t max_bytes = 2000000000) // by default refuse operation if uncompressed data is > 2GB
+               std::size_t max_bytes = 20000000000) // by default refuse operation if uncompressed data is > 20GB
         : max_(max_bytes),
           level_(level)
     {
