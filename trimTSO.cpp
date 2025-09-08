@@ -17,19 +17,30 @@
 #include <gzip/utils.hpp>
 #include <gzip/version.hpp>
 
+// Structure to hold adapter information and statistics
+struct AdapterInfo {
+    std::string name;
+    std::string sequence;
+    size_t trimCount = 0;
+    
+    AdapterInfo(const std::string& n, const std::string& s) : name(n), sequence(s) {}
+};
+
 class AdapterTrimmer {
 private:
     // Define TrimmedRead at the class level
     struct TrimmedRead {
         std::string sequence;
         std::string quality;
+        int trimmedAdapterIndex = -1; // Index of adapter that was used for trimming
     };
 
-    std::vector<std::string> adapterArray;
+    std::vector<AdapterInfo> adapterArray;
     int matchLength;
     int maxMismatches;
     int maxMismatchCost;
     bool recurse;
+    mutable std::mutex statsMutex; // Mutex for thread-safe statistics updates
 
     // 逆配列の作成（相補配列）
     std::string reverseComplement(const std::string& seq) {
@@ -80,23 +91,32 @@ private:
     }
 
 public:
-    AdapterTrimmer(const std::vector<std::string>& adapterSeqs, int matchLen = 8, int maxMismatchCount = 0, int maxCosts = 0, bool rc = false)
-        : adapterArray(adapterSeqs), matchLength(matchLen), maxMismatches(maxMismatchCount), maxMismatchCost(maxCosts), recurse(rc) {}
+    AdapterTrimmer(const std::vector<AdapterInfo>& adapterInfos, int matchLen = 8, int maxMismatchCount = 0, int maxCosts = 0, bool rc = false)
+        : adapterArray(adapterInfos), matchLength(matchLen), maxMismatches(maxMismatchCount), maxMismatchCost(maxCosts), recurse(rc) {}
 
     std::pair<std::string, std::string> trimAdapters(const std::string& sequence, const std::string& quality) {
         if (sequence.empty() || quality.empty()) {
             return {sequence, quality};
         }
 
-        // 1. リードからアダプターをトリム (Forward)
+        // 1. リードからアダプターをトリミング (Forward)
         TrimmedRead forwardTrimmed = forwardTrim(sequence, quality);
 
         // 2. リードを相補配列に変換
         std::string rcSequence = reverseComplement(forwardTrimmed.sequence);
         std::string rcQuality = reverseString(forwardTrimmed.quality);
 
-        // 3. 相補配列をトリム
+        // 3. 相補配列をトリミング 
         TrimmedRead rcTrimmed = forwardTrim(rcSequence, rcQuality);
+
+        // Update statistics based on which adapter was used
+        if (forwardTrimmed.trimmedAdapterIndex != -1) {
+            std::lock_guard<std::mutex> lock(statsMutex);
+            adapterArray[forwardTrimmed.trimmedAdapterIndex].trimCount++;
+        } else if (rcTrimmed.trimmedAdapterIndex != -1) {
+            std::lock_guard<std::mutex> lock(statsMutex);
+            adapterArray[rcTrimmed.trimmedAdapterIndex].trimCount++;
+        }
 
         // 4. リードをフォワード配列に戻す（相補配列→元の配列）
         std::string finalSequence = reverseComplement(rcTrimmed.sequence);
@@ -105,58 +125,104 @@ public:
         return {finalSequence, finalQuality};
     }
 
+    // Method to get trimming statistics
+    std::vector<AdapterInfo> getTrimStats() const {
+        std::lock_guard<std::mutex> lock(statsMutex);
+        return adapterArray;
+    }
+
+    // Method to print trimming statistics
+    void printTrimStats() const {
+        std::lock_guard<std::mutex> lock(statsMutex);
+        std::cout << "\n=== Adapter Trimming Statistics ===" << std::endl;
+        std::cout << "Adapter Name\tSequence\tTrimmed Reads" << std::endl;
+        std::cout << "----------------------------------------" << std::endl;
+        
+        size_t totalTrimmed = 0;
+        for (const auto& adapter : adapterArray) {
+            std::cout << adapter.name << "\t" << adapter.sequence << "\t" << adapter.trimCount << std::endl;
+            totalTrimmed += adapter.trimCount;
+        }
+        
+        std::cout << "----------------------------------------" << std::endl;
+        std::cout << "Total trimmed reads: " << totalTrimmed << std::endl;
+    }
+
+    // Method to write trimming statistics to file
+    void writeTrimStatsToFile(const std::string& filename) const {
+        std::lock_guard<std::mutex> lock(statsMutex);
+        std::ofstream outFile(filename);
+        if (!outFile.is_open()) {
+            std::cerr << "Warning: Could not open statistics file: " << filename << std::endl;
+            return;
+        }
+        
+        outFile << "Adapter_Name\tSequence\tTrimmed_Reads\n";
+        size_t totalTrimmed = 0;
+        
+        for (const auto& adapter : adapterArray) {
+            outFile << adapter.name << "\t" << adapter.sequence << "\t" << adapter.trimCount << "\n";
+            totalTrimmed += adapter.trimCount;
+        }
+        
+        outFile << "Total\tAll_Adapters\t" << totalTrimmed << "\n";
+        outFile.close();
+        
+        std::cout << "Trimming statistics written to: " << filename << std::endl;
+    }
+
 private:
     // 配列の前方からのトリミング（ミスマッチ許容）
     TrimmedRead forwardTrim(const std::string& sequence, const std::string& quality) {
         std::string trimmedSeq = sequence;
         std::string trimmedQual = quality;
         bool trimmed = true;
-        for (const auto& adapter : adapterArray) {
-    trimmed = true;  // adapterごとにトリミングを再度有効にする
-    while (trimmed && trimmedSeq.length() >= static_cast<size_t>(matchLength)) {
-        trimmed = false;  // ここで false にリセットする
-        for (int x = static_cast<int>(adapter.length()); x >= matchLength; --x) {
-            if (trimmedSeq.length() >= static_cast<size_t>(x)) {
-                // トリミング確認（順方向アダプター）
-                std::string adapterEnd = adapter.substr(adapter.length() - x);
-                std::string toMatch = trimmedSeq.substr(0, x);
+        int usedAdapterIndex = -1;
+        
+        for (size_t adapterIdx = 0; adapterIdx < adapterArray.size(); ++adapterIdx) {
+            const auto& adapter = adapterArray[adapterIdx].sequence;
+            trimmed = true;  // adapterごとにトリミングを再度有効にする
+            
+            while (trimmed && trimmedSeq.length() >= static_cast<size_t>(matchLength)) {
+                trimmed = false;  // ここで false にリセットする
+                for (int x = static_cast<int>(adapter.length()); x >= matchLength; --x) {
+                    if (trimmedSeq.length() >= static_cast<size_t>(x)) {
+                        // トリミング確認（順方向アダプター）
+                        std::string adapterEnd = adapter.substr(adapter.length() - x);
+                        std::string toMatch = trimmedSeq.substr(0, x);
 
-                // ミスマッチチェック
-                int mismatches = 0;
-                if (maxMismatchCost > 0){
-                    mismatches = calculateEditDistance(adapterEnd, toMatch);
-                }
-                else{
-                    for (size_t i = 0; i < toMatch.length(); ++i) {
-                    mismatches += calculateBaseDistance(toMatch[i], adapterEnd[i]);
-                    }
-                }
-                
-                if (maxMismatchCost > 0){
-                    if (mismatches <= maxMismatchCost) {
-                        trimmedSeq = trimmedSeq.substr(x);
-                        trimmedQual = trimmedQual.substr(x);
-                        if (recurse == true) {
-                            trimmed = true;
+                        // ミスマッチチェック
+                        int mismatches = 0;
+                        if (maxMismatchCost > 0){
+                            mismatches = calculateEditDistance(adapterEnd, toMatch);
                         }
-                        break;  // 現在のadapterで一致したのでbreak
-                    }
-                }
-                else{
-                    if (mismatches <= maxMismatches) {
-                        trimmedSeq = trimmedSeq.substr(x);
-                        trimmedQual = trimmedQual.substr(x);
-                        if (recurse == true) {
-                            trimmed = true;
+                        else{
+                            for (size_t i = 0; i < toMatch.length(); ++i) {
+                            mismatches += calculateBaseDistance(toMatch[i], adapterEnd[i]);
+                            }
                         }
-                        break;  // 現在のadapterで一致したのでbreak
+                        
+                        bool shouldTrim = false;
+                        if (maxMismatchCost > 0){
+                            shouldTrim = (mismatches <= maxMismatchCost);
+                        } else {
+                            shouldTrim = (mismatches <= maxMismatches);
+                        }
+                        
+                        if (shouldTrim) {
+                            trimmedSeq = trimmedSeq.substr(x);
+                            trimmedQual = trimmedQual.substr(x);
+                            usedAdapterIndex = adapterIdx; // Record which adapter was used
+                            if (recurse == true) {
+                                trimmed = true;
+                            }
+                            break;  // 現在のadapterで一致したのでbreak
+                        }
                     }
                 }
             }
         }
-    }
-}
-        return {trimmedSeq, trimmedQual};
+        return {trimmedSeq, trimmedQual, usedAdapterIndex};
     }
 
     // 文字列を逆にする
@@ -174,7 +240,7 @@ private:
     std::string outputFile1;
     std::string outputFile2;
     std::string singleOutputFile;
-    std::vector<std::string> adapterArray;
+    std::vector<AdapterInfo> adapterArray;
     int matchLength;
     int minReadLength;
     int maxMismatches;
@@ -288,7 +354,7 @@ public:
     FastqProcessor(const std::string& in1, const std::string& in2,
                    const std::string& out1, const std::string& out2,
                    const std::string& single, 
-                   const std::vector<std::string>& adapterSeqs, 
+                   const std::vector<AdapterInfo>& adapterInfos, 
                    int matchLen = 8,
                    int minLen = 0,
                    int maxMismatchCount = 0,
@@ -297,7 +363,7 @@ public:
         : inputFile1(in1), inputFile2(in2), 
           outputFile1(out1), outputFile2(out2), 
           singleOutputFile(single), 
-          adapterArray(adapterSeqs), 
+          adapterArray(adapterInfos), 
           matchLength(matchLen),
           minReadLength(minLen),
           maxMismatches(maxMismatchCount),
@@ -340,6 +406,13 @@ public:
             // Flush remaining single-end data
             flushBufferToFile(out1Buffer, outputFile1);
         }
+
+        // Print and write statistics
+        trimmer.printTrimStats();
+        
+        // Create statistics filename based on output file
+        std::string statsFile = outputFile1.substr(0, outputFile1.find_last_of('.')) + "_trimming_stats.txt";
+        trimmer.writeTrimStatsToFile(statsFile);
     }
 };
 
@@ -368,15 +441,15 @@ namespace gzip_custom {
     }
 }
 
-// Custom function to read multi-FASTA file
-std::vector<std::string> readAdaptersFromFASTA(const std::string& filename) {
+// Modified function to read multi-FASTA file and extract adapter names
+std::vector<AdapterInfo> readAdaptersFromFASTA(const std::string& filename) {
     std::ifstream file(filename);
     if (!file.is_open()) {
         throw std::runtime_error("Could not open adapter file: " + filename);
     }
 
-    std::vector<std::string> adapters;
-    std::string line, currentSequence;
+    std::vector<AdapterInfo> adapters;
+    std::string line, currentSequence, currentName;
     bool inSequence = false;
 
     while (std::getline(file, line)) {
@@ -389,15 +462,23 @@ std::vector<std::string> readAdaptersFromFASTA(const std::string& filename) {
         // Check if this is a header line
         if (line[0] == '>') {
             // If we were previously building a sequence, add it to adapters
-            if (!currentSequence.empty()) {
+            if (!currentSequence.empty() && !currentName.empty()) {
                 // Remove any whitespace from the sequence
                 currentSequence.erase(
                     std::remove_if(currentSequence.begin(), currentSequence.end(), ::isspace), 
                     currentSequence.end()
                 );
-                adapters.push_back(currentSequence);
+                adapters.emplace_back(currentName, currentSequence);
                 currentSequence.clear();
             }
+            
+            // Extract adapter name (remove '>' and take everything up to first space)
+            currentName = line.substr(1); // Remove '>'
+            size_t spacePos = currentName.find_first_of(" \t");
+            if (spacePos != std::string::npos) {
+                currentName = currentName.substr(0, spacePos);
+            }
+            
             inSequence = true;
             continue;
         }
@@ -409,13 +490,13 @@ std::vector<std::string> readAdaptersFromFASTA(const std::string& filename) {
     }
 
     // Add the last sequence if not empty
-    if (!currentSequence.empty()) {
+    if (!currentSequence.empty() && !currentName.empty()) {
         // Remove any whitespace from the sequence
         currentSequence.erase(
             std::remove_if(currentSequence.begin(), currentSequence.end(), ::isspace), 
             currentSequence.end()
         );
-        adapters.push_back(currentSequence);
+        adapters.emplace_back(currentName, currentSequence);
     }
 
     return adapters;
@@ -431,7 +512,7 @@ int main(int argc, char* argv[]) {
     int maxMismatchCost = 0;
     bool recurse = false;
     bool gzipout = false;
-    std::vector<std::string> adapterArray;
+    std::vector<AdapterInfo> adapterArray;
 
     int opt;
     while ((opt = getopt(argc, argv, "i:I:o:O:s:f:m:l:n:c:rgh")) != -1) {
@@ -557,7 +638,7 @@ int main(int argc, char* argv[]) {
     // Print out the adapter sequences (for debugging/verification)
     std::cout << "Loaded " << adapterArray.size() << " adapter sequences:" << std::endl;
     for (const auto& adapter : adapterArray) {
-        std::cout << adapter << std::endl;
+        std::cout << adapter.name << ": " << adapter.sequence << std::endl;
     }
 
 // 入力ファイルを処理する部分を修正
@@ -625,10 +706,14 @@ for (int i = 0; i < numFiles; ++i) {
         compressAndWrite(outputFile1);
 
         // outputFile2の圧縮
-        compressAndWrite(outputFile2);
+        if (!outputFile2.empty()) {
+            compressAndWrite(outputFile2);
+        }
 
         // singleOutputFileの圧縮
-        compressAndWrite(singleOutputFile);
+        if (!singleOutputFile.empty()) {
+            compressAndWrite(singleOutputFile);
+        }
     }
 
     return 0;
