@@ -11,11 +11,7 @@
 #include <getopt.h>
 #include <zlib.h>
 #include <unistd.h>
-#include <gzip/compress.hpp>
-#include <gzip/config.hpp>
-#include <gzip/decompress.hpp>
-#include <gzip/utils.hpp>
-#include <gzip/version.hpp>
+#include <zlib.h>
 
 // Structure to hold adapter information and statistics
 struct AdapterInfo {
@@ -418,28 +414,105 @@ public:
 
 // Custom wrapper functions to resolve casting issues
 namespace gzip_custom {
-    std::string decompress(const char* data, size_t size) {
-        std::string output;
-        gzip::Decompressor decomp;
-        
-        // Create a non-const copy to use with reinterpret_cast
-        std::vector<char> data_copy(data, data + size);
-        
-        decomp.decompress(output, data_copy.data(), data_copy.size());
-        return output;
+
+std::string decompress(const char* data, size_t size) {
+    if (!data || size == 0) return "";
+
+    z_stream strm{};
+    // 入力（全体）を最初に設定
+    strm.next_in  = reinterpret_cast<Bytef*>(const_cast<char*>(data));
+    strm.avail_in = static_cast<uInt>(size);
+
+    // 16 + MAX_WBITS で gzip ヘッダ対応
+    if (inflateInit2(&strm, 16 + MAX_WBITS) != Z_OK) {
+        throw std::runtime_error("inflateInit2 failed");
     }
 
-    std::string compress(const std::string& input) {
-        std::string output;
-        gzip::Compressor comp;
-        
-        // Create a non-const copy to use with reinterpret_cast
-        std::string input_copy = input;
-        
-        comp.compress(output, input_copy.data(), input_copy.size());
-        return output;
+    std::string output;
+    output.reserve(size * 3); // だいたいの予測（必要に応じて拡張されます）
+
+    // 出力バッファは少し大きめ
+    unsigned char outbuf[64 * 1024];
+
+    while (true) {
+        strm.next_out  = outbuf;
+        strm.avail_out = static_cast<uInt>(sizeof(outbuf));
+
+        int ret = inflate(&strm, Z_NO_FLUSH);
+
+        // 今回の inflate 呼び出しで出た出力を追加
+        size_t have = sizeof(outbuf) - strm.avail_out;
+        if (have) {
+            output.append(reinterpret_cast<const char*>(outbuf), have);
+        }
+
+        if (ret == Z_STREAM_END) {
+            // 1 メンバーの終端に到達
+            if (strm.avail_in == 0) {
+                // 入力はすべて消費 -> すべてのメンバーを解凍し終えた
+                break;
+            }
+            // まだ入力が残っている -> 次のメンバーを続けて解凍
+            int r = inflateReset2(&strm, 16 + MAX_WBITS);
+            if (r != Z_OK) {
+                inflateEnd(&strm);
+                throw std::runtime_error("inflateReset2 failed");
+            }
+            continue; // 次メンバーへ
+        }
+
+        if (ret == Z_OK) {
+            // 継続。入力が尽きたのに Z_STREAM_END に達していない場合は壊れている可能性
+            if (strm.avail_in == 0 && strm.avail_out != 0) {
+                inflateEnd(&strm);
+                throw std::runtime_error("Unexpected EOF in gzip stream (truncated file?)");
+            }
+            // まだ処理継続
+            continue;
+        }
+
+        // それ以外はエラー
+        inflateEnd(&strm);
+        std::ostringstream oss;
+        oss << "inflate failed (ret=" << ret << ")";
+        throw std::runtime_error(oss.str());
     }
+
+    inflateEnd(&strm);
+    return output;
 }
+
+std::string compress(const std::string& input) {
+    if (input.empty()) return "";
+    z_stream strm{};
+    strm.next_in  = reinterpret_cast<Bytef*>(const_cast<char*>(input.data()));
+    strm.avail_in = static_cast<uInt>(input.size());
+    if (deflateInit2(&strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                     16 + MAX_WBITS, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+        throw std::runtime_error("deflateInit2 failed");
+    }
+    std::string output;
+    unsigned char buffer[64 * 1024];
+    int ret;
+    do {
+        strm.next_out  = buffer;
+        strm.avail_out = sizeof(buffer);
+        ret = deflate(&strm, strm.avail_in ? Z_NO_FLUSH : Z_FINISH);
+        if (ret == Z_STREAM_ERROR) {
+            deflateEnd(&strm);
+            throw std::runtime_error("deflate failed");
+        }
+        size_t have = sizeof(buffer) - strm.avail_out;
+        if (have) output.append(reinterpret_cast<const char*>(buffer), have);
+    } while (ret != Z_STREAM_END);
+    deflateEnd(&strm);
+    return output;
+}
+
+} // namespace gzip_custom
+// ---- ここまで置換 ----
+
+
 
 // Modified function to read multi-FASTA file and extract adapter names
 std::vector<AdapterInfo> readAdaptersFromFASTA(const std::string& filename) {
@@ -501,6 +574,12 @@ std::vector<AdapterInfo> readAdaptersFromFASTA(const std::string& filename) {
 
     return adapters;
 }
+
+bool is_gzip_compressed(const char* data, size_t size) {
+    // gzipのマジックナンバーは 0x1f 0x8b
+    return size >= 2 && static_cast<unsigned char>(data[0]) == 0x1f && static_cast<unsigned char>(data[1]) == 0x8b;
+}
+
 
 // Main function modifications
 int main(int argc, char* argv[]) {
@@ -662,7 +741,7 @@ for (int i = 0; i < numFiles; ++i) {
     std::string& decompressed_data = (i == 0) ? decompressed_data1 : decompressed_data2;
 
     // gzip圧縮されているか判定
-    if (gzip::is_compressed(buffer.data(), buffer.size())) {
+    if (is_gzip_compressed(buffer.data(), buffer.size())) {
         std::cout << "File " << inputFiles[i] << " is gzip-compressed. Decompressing..." << std::endl;
         decompressed_data = gzip_custom::decompress(buffer.data(), buffer.size());
         std::cout << "decompressed" << std::endl;
@@ -671,6 +750,7 @@ for (int i = 0; i < numFiles; ++i) {
         decompressed_data.assign(buffer.begin(), buffer.end());  // そのまま読み込み
         std::cout << "done" << std::endl;
     }
+
 }
 
     // Modify the processor creation to pass maxMismatches
@@ -703,17 +783,20 @@ for (int i = 0; i < numFiles; ++i) {
     if (gzipout == true) {
         std::cout << "Compressing output files" << std::endl;
         // outputFile1の圧縮
-        compressAndWrite(outputFile1);
+        if (!outputFile1.empty() && std::filesystem::exists(outputFile1)) {
+            compressAndWrite(outputFile1);
+        }
 
         // outputFile2の圧縮
-        if (!outputFile2.empty()) {
+        if (!outputFile2.empty() && std::filesystem::exists(outputFile2)) {
             compressAndWrite(outputFile2);
         }
 
         // singleOutputFileの圧縮
-        if (!singleOutputFile.empty()) {
+        if (!singleOutputFile.empty() && std::filesystem::exists(singleOutputFile)) {
             compressAndWrite(singleOutputFile);
         }
+
     }
 
     return 0;
