@@ -6,12 +6,9 @@ This tool is also useful for adapter/primer trimming as it recognizes and trims 
 
 Compile
 
-g++ -I ./ -std=c++17 trimTSO.cpp -lz -pthread -O3 -o trimTSO
+g++ -std=c++17 trimTSO.cpp -lz -pthread -O3 -o trimTSO
 
 
 Usage
 
 ./trimTSO -i InputF.fastq(.gz) -I InputR..fastq(.gz) -o output_F -O output_R -s single -f adapters.fa [-m 8 -n 1 -l 20 -r -g]
-
-
-gzip-hpp(https://github.com/mapbox/gzip-hpp) to (de)compress gz
