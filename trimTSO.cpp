@@ -36,6 +36,7 @@ private:
     int maxMismatches;
     int maxMismatchCost;
     bool recurse;
+    bool partial; // New flag for partial trimming
     mutable std::mutex statsMutex; // Mutex for thread-safe statistics updates
 
     // 逆配列の作成（相補配列）
@@ -87,8 +88,8 @@ private:
     }
 
 public:
-    AdapterTrimmer(const std::vector<AdapterInfo>& adapterInfos, int matchLen = 8, int maxMismatchCount = 0, int maxCosts = 0, bool rc = false)
-        : adapterArray(adapterInfos), matchLength(matchLen), maxMismatches(maxMismatchCount), maxMismatchCost(maxCosts), recurse(rc) {}
+    AdapterTrimmer(const std::vector<AdapterInfo>& adapterInfos, int matchLen = 8, int maxMismatchCount = 0, int maxCosts = 0, bool rc = false, bool p = false)
+        : adapterArray(adapterInfos), matchLength(matchLen), maxMismatches(maxMismatchCount), maxMismatchCost(maxCosts), recurse(rc), partial(p) {}
 
     std::pair<std::string, std::string> trimAdapters(const std::string& sequence, const std::string& quality) {
         if (sequence.empty() || quality.empty()) {
@@ -217,6 +218,47 @@ private:
                     }
                 }
             }
+
+            // Partial adapter trimming (only if enabled)
+            if (!trimmed && partial) {
+                 for (int x = matchLength; x < static_cast<int>(adapter.length()); ++x) {
+                    if (trimmedSeq.length() >= static_cast<size_t>(x)) {
+                        // Check if the beginning of the read matches ANY part of the adapter
+                        for (size_t y = 0; y <= adapter.length() - x; ++y) {
+                            std::string adapterSub = adapter.substr(y, x);
+                            std::string toMatch = trimmedSeq.substr(0, x);
+                            
+                            int mismatches = 0;
+                            if (maxMismatchCost > 0){
+                                mismatches = calculateEditDistance(adapterSub, toMatch);
+                            }
+                            else{
+                                for (size_t i = 0; i < toMatch.length(); ++i) {
+                                    mismatches += calculateBaseDistance(toMatch[i], adapterSub[i]);
+                                }
+                            }
+                            
+                            bool shouldTrim = false;
+                            if (maxMismatchCost > 0){
+                                shouldTrim = (mismatches <= maxMismatchCost);
+                            } else {
+                                shouldTrim = (mismatches <= maxMismatches);
+                            }
+                            
+                            if (shouldTrim) {
+                                trimmedSeq = trimmedSeq.substr(x);
+                                trimmedQual = trimmedQual.substr(x);
+                                usedAdapterIndex = adapterIdx;
+                                if (recurse == true) {
+                                    trimmed = true;
+                                }
+                                break; 
+                            }
+                        }
+                        if (trimmed) break;
+                    }
+                 }
+            }
         }
         return {trimmedSeq, trimmedQual, usedAdapterIndex};
     }
@@ -242,6 +284,7 @@ private:
     int maxMismatches;
     int maxMismatchCost;
     bool recurse;
+    bool partial;
     bool isPaired;  // New flag to indicate if processing paired-end data
 
     std::mutex writeMutex;
@@ -320,8 +363,14 @@ private:
         reads.clear();
         quals.clear();
 
+        // Helper to trim \r
+        auto trim = [](std::string& s) {
+            if (!s.empty() && s.back() == '\r') s.pop_back();
+        };
+
         // Read entire file
         while (std::getline(iss, line)) {
+            trim(line);
             std::string sequence, plus, quality;
 
             // Validate @readname line
@@ -333,8 +382,14 @@ private:
             // Check if we have enough data for a complete FASTQ entry
             if (!std::getline(iss, sequence) || 
                 !std::getline(iss, plus) || 
-                !std::getline(iss, quality) ||
-                plus.empty() || 
+                !std::getline(iss, quality)) {
+                break;  // Stop if we can't read a complete entry
+            }
+            trim(sequence);
+            trim(plus);
+            trim(quality);
+
+            if (plus.empty() || 
                 plus[0] != '+' || 
                 sequence.length() != quality.length()) {
                 break;  // Stop if we can't read a complete entry
@@ -355,7 +410,8 @@ public:
                    int minLen = 0,
                    int maxMismatchCount = 0,
                    int maxCosts = 0,
-                   bool rc = false)
+                   bool rc = false,
+                   bool p = false)
         : inputFile1(in1), inputFile2(in2), 
           outputFile1(out1), outputFile2(out2), 
           singleOutputFile(single), 
@@ -365,10 +421,11 @@ public:
           maxMismatches(maxMismatchCount),
           maxMismatchCost(maxCosts),
           recurse(rc),
+          partial(p),
           isPaired(!in2.empty()) {}
 
     void process() {
-        AdapterTrimmer trimmer(adapterArray, matchLength, maxMismatches, maxMismatchCost, recurse);
+        AdapterTrimmer trimmer(adapterArray, matchLength, maxMismatches, maxMismatchCost, recurse, partial);
         std::vector<std::string> readnames1, reads1, quals1;
         std::vector<std::string> readnames2, reads2, quals2;
 
@@ -590,11 +647,12 @@ int main(int argc, char* argv[]) {
     int maxMismatches = 0;
     int maxMismatchCost = 0;
     bool recurse = false;
+    bool partial = false;
     bool gzipout = false;
     std::vector<AdapterInfo> adapterArray;
 
     int opt;
-    while ((opt = getopt(argc, argv, "i:I:o:O:s:f:m:l:n:c:rgh")) != -1) {
+    while ((opt = getopt(argc, argv, "i:I:o:O:s:f:m:l:n:c:rpgh")) != -1) {
         switch (opt) {
             case 'i':
                 inputFile1 = optarg;
@@ -629,6 +687,9 @@ int main(int argc, char* argv[]) {
             case 'r':
                 recurse = true;
                 break;
+            case 'p':
+                partial = true;
+                break;
             case 'g':
                 gzipout = true;
                 break;
@@ -648,6 +709,7 @@ int main(int argc, char* argv[]) {
                           << "-n max_mismatches_count (default: 0)\n"
                           << "-c max_mismatch_cost (increases computation time; default: 0)\n"
                           << "-r trim recursively (only for SMART-adapter trim; default: false)\n"
+                          << "-p trim partial adapters (default: false)\n"
                           << "-g gzip output (default: false)\n";
                 return 1;
             default:
@@ -698,6 +760,7 @@ int main(int argc, char* argv[]) {
         std::cout << "Max mismatches: " << maxMismatches << "\n";
     }
     std::cout << "Recursive: " << (recurse ? "true" : "false") << "\n"
+              << "Partial: " << (partial ? "true" : "false") << "\n"
               << "Gzip output: " << (gzipout ? "true" : "false") << "\n";
 
     // Read adapter sequences from multi-FASTA file
@@ -758,7 +821,7 @@ for (int i = 0; i < numFiles; ++i) {
     FastqProcessor processor(decompressed_data1, decompressed_data2, 
                              outputFile1, outputFile2, singleOutputFile, 
                              adapterArray, matchLength, minReadLength, 
-                             maxMismatches, maxMismatchCost, recurse);  // Add maxMismatches to constructor
+                             maxMismatches, maxMismatchCost, recurse, partial);  // Add maxMismatches to constructor
     processor.process();
     std::cout << "Completed" << std::endl;
 
@@ -801,3 +864,4 @@ for (int i = 0; i < numFiles; ++i) {
 
     return 0;
 }
+
