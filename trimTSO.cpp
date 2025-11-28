@@ -44,21 +44,57 @@ private:
         std::string rc = seq;
         std::reverse(rc.begin(), rc.end());
         for (char& c : rc) {
+            c = toupper(c);
             switch (c) {
                 case 'A': c = 'T'; break;
                 case 'T': c = 'A'; break;
+                case 'U': c = 'A'; break;
                 case 'C': c = 'G'; break;
                 case 'G': c = 'C'; break;
+                case 'R': c = 'Y'; break; // Purine (A/G) -> Pyrimidine (T/C)
+                case 'Y': c = 'R'; break; // Pyrimidine (C/T) -> Purine (G/A)
+                case 'K': c = 'M'; break; // Keto (G/T) -> Amino (A/C)
+                case 'M': c = 'K'; break; // Amino (A/C) -> Keto (T/G)
+                case 'S': c = 'S'; break; // Strong (G/C) -> Strong (C/G)
+                case 'W': c = 'W'; break; // Weak (A/T) -> Weak (T/A)
+                case 'B': c = 'V'; break; // Not A (C/G/T) -> Not T (G/C/A)
+                case 'D': c = 'H'; break; // Not C (A/G/T) -> Not G (T/C/A)
+                case 'H': c = 'D'; break; // Not G (A/C/T) -> Not C (T/G/A)
+                case 'V': c = 'B'; break; // Not T (A/C/G) -> Not A (T/G/C)
+                case 'N': c = 'N'; break;
                 default: c = 'N'; break;
             }
         }
         return rc;
     }
 
+    // Check if a base matches an IUPAC code
+    bool isIUPACMatch(char readBase, char adapterBase) {
+        readBase = toupper(readBase);
+        adapterBase = toupper(adapterBase);
+        
+        if (readBase == adapterBase) return true;
+        if (adapterBase == 'N') return true; // Adapter N matches anything
+        
+        switch (adapterBase) {
+            case 'R': return (readBase == 'A' || readBase == 'G');
+            case 'Y': return (readBase == 'C' || readBase == 'T');
+            case 'S': return (readBase == 'G' || readBase == 'C');
+            case 'W': return (readBase == 'A' || readBase == 'T');
+            case 'K': return (readBase == 'G' || readBase == 'T');
+            case 'M': return (readBase == 'A' || readBase == 'C');
+            case 'B': return (readBase != 'A'); // C, G, T
+            case 'D': return (readBase != 'C'); // A, G, T
+            case 'H': return (readBase != 'G'); // A, C, T
+            case 'V': return (readBase != 'T'); // A, C, G
+            default: return false;
+        }
+    }
+
     // 塩基間の距離を計算（他と異なる場合は1、同じ場合は0）
     int calculateBaseDistance(char base1, char base2) {
-        // 塩基が異なる場合は1、同じ場合は0を返す
-        return (base1 != base2) ? 1 : 0;
+        // base1: read sequence, base2: adapter sequence (can contain IUPAC codes)
+        return isIUPACMatch(base1, base2) ? 0 : 1;
     }
 
     int calculateEditDistance(const std::string& seq1, const std::string& seq2) {
@@ -864,4 +900,3 @@ for (int i = 0; i < numFiles; ++i) {
 
     return 0;
 }
-
