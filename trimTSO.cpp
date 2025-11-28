@@ -111,7 +111,7 @@ private:
         // DPテーブルの更新
         for (size_t i = 1; i <= len1; ++i) {
             for (size_t j = 1; j <= len2; ++j) {
-                int cost = calculateBaseDistance(seq1[i - 1], seq2[j - 1]); // ミスマッチコスト
+                int cost = calculateBaseDistance(seq2[j - 1], seq1[i - 1]); // ミスマッチコスト (Read, Adapter)
                 dp[i][j] = std::min({ 
                     dp[i - 1][j] + 1,     // デリーション（seq1の1文字を削除）
                     dp[i][j - 1] + 1,      // インサーション（seq2に1文字挿入）
