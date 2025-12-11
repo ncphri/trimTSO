@@ -11,4 +11,4 @@ g++ -std=c++17 trimTSO.cpp -lz -pthread -O3 -o trimTSO
 
 Usage
 
-./trimTSO -i InputF.fastq(.gz) -I InputR..fastq(.gz) -o output_F -O output_R -s single -f adapters.fa [-m 8 -n 1 -l 20 -r -g]
+./trimTSO -i InputF.fastq(.gz) [-I InputR..fastq(.gz)] -o output_F [-O output_R -s single] -f adapters.fa [-m 8 -n 1 -l 20 -r -g]
