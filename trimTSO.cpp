@@ -10,6 +10,7 @@
 #include <mutex>
 #include <thread>
 #include <getopt.h>
+#include <cstdlib>
 #include <zlib.h>
 #include <unistd.h>
 #include <zlib.h>
@@ -255,6 +256,9 @@ static void threadWorker(const std::vector<AdapterInfo>& adapterArray,
                          const std::vector<std::string>& readnames2,
                          const std::vector<std::string>& reads2,
                          const std::vector<std::string>& quals2,
+                         const std::vector<std::string>& orphanNames,
+                         const std::vector<std::string>& orphanReads,
+                         const std::vector<std::string>& orphanQuals,
                          size_t start, size_t end, bool isPaired,
                          ThreadResult& result) {
     // Create a clean copy with zero trim counts so each thread only counts its own NEW trims
@@ -263,7 +267,18 @@ static void threadWorker(const std::vector<AdapterInfo>& adapterArray,
     for (size_t a = 0; a < adapterArray.size(); ++a)
         cleanAdapter.emplace_back(adapterArray[a].name, adapterArray[a].sequence);
     AdapterTrimmer trimmer(cleanAdapter, matchLength, maxMismatches, maxMismatchCost, recurse, partial);
+    const size_t pairedN = readnames1.size();
     for (size_t i = start; i < end; ++i) {
+        if (i >= pairedN) {
+            // Orphaned mate (its partner record was malformed/skipped):
+            // treated exactly like a pair whose mate fell below min length —
+            // trimmed and written to the single output.
+            size_t o = i - pairedN;
+            auto [trimmedSeq, trimmedQual] = trimmer.trimAdapters(orphanReads[o], orphanQuals[o]);
+            if (trimmedSeq.size() >= static_cast<size_t>(minReadLength))
+                result.singleOut += orphanNames[o] + "\n" + trimmedSeq + "\n+\n" + trimmedQual + "\n";
+            continue;
+        }
         if (isPaired) {
             auto [trimmedSeq1, trimmedQual1] = trimmer.trimAdapters(reads1[i], quals1[i]);
             auto [trimmedSeq2, trimmedQual2] = trimmer.trimAdapters(reads2[i], quals2[i]);
@@ -294,75 +309,234 @@ static bool isGzipFile(const std::string& path) {
     return (ifs.gcount() == 2 && buf[0] == 0x1f && buf[1] == 0x8b);
 }
 
-static size_t readGzipChunk(gzFile& gz, size_t maxRecords,
-                            std::vector<std::string>& readnames,
-                            std::vector<std::string>& reads,
-                            std::vector<std::string>& quals) {
-    char buf[4096];
+// ─── Streaming line reader (fastp-style): buffered gzread/ifstream with NO line-length limit ───
+class FastqLineReader {
+private:
+    static constexpr size_t BUF_SIZE = 1 << 16; // 64KB decompressed read-ahead
+    gzFile gz_ = nullptr;
+    std::ifstream ifs_;
+    std::string pending_;
+    std::string pushback_;
+    bool hasPushback_ = false;
+    bool eof_ = false;
+
+public:
+    bool openGz(const std::string& path) {
+        gz_ = gzopen(path.c_str(), "rb");
+        return gz_ != nullptr;
+    }
+    bool openPlain(const std::string& path) {
+        ifs_.open(path, std::ios_base::binary);
+        return ifs_.is_open();
+    }
+    void close() {
+        if (gz_) { gzclose(gz_); gz_ = nullptr; }
+        if (ifs_.is_open()) ifs_.close();
+    }
+    void pushback(const std::string& line) { pushback_ = line; hasPushback_ = true; }
+    // Unbounded getline: assembles lines of any length from buffered reads.
+    bool getline(std::string& line) {
+        if (hasPushback_) { line.swap(pushback_); hasPushback_ = false; return true; }
+        while (true) {
+            size_t nl = pending_.find('\n');
+            if (nl != std::string::npos) {
+                line.assign(pending_, 0, nl);
+                pending_.erase(0, nl + 1);
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                return true;
+            }
+            if (eof_) {
+                if (!pending_.empty()) {
+                    line.swap(pending_);
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+                    return true;
+                }
+                return false;
+            }
+            char chunk[BUF_SIZE];
+            if (gz_) {
+                int n = gzread(gz_, chunk, static_cast<unsigned>(BUF_SIZE));
+                if (n <= 0) { eof_ = true; continue; }
+                pending_.append(chunk, static_cast<size_t>(n));
+            } else {
+                pending_.resize(pending_.size() + BUF_SIZE);
+                ifs_.read(&pending_[pending_.size() - BUF_SIZE], BUF_SIZE);
+                std::streamsize got = ifs_.gcount();
+                pending_.resize(pending_.size() - BUF_SIZE + static_cast<size_t>(got));
+                if (got < static_cast<std::streamsize>(BUF_SIZE)) eof_ = true;
+            }
+        }
+    }
+};
+
+// A line qualifies as a sequence line if it is non-empty and purely IUPAC bases.
+static bool isDnaLine(const std::string& s) {
+    if (s.empty()) return false;
+    for (char c : s) {
+        switch (toupper(static_cast<unsigned char>(c))) {
+            case 'A': case 'C': case 'G': case 'T': case 'U': case 'N':
+            case 'R': case 'Y': case 'K': case 'M': case 'S': case 'W':
+            case 'B': case 'D': case 'H': case 'V': break;
+            default: return false;
+        }
+    }
+    return true;
+}
+
+// After a malformed record the read position may be out of sync. Scan forward
+// for the next plausible record start: a line beginning with '@' whose NEXT
+// line is a pure-DNA sequence line. A bare '@'-leading line is NOT trusted as
+// a header because quality strings can also start with '@' (Q31+). The
+// sequence line is pushed back so the caller reads it next. `candidate`, if
+// given, is tried first as the header candidate.
+static bool resyncToNextRecord(FastqLineReader& reader, std::string& header,
+                               size_t* dropped = nullptr,
+                               const std::string* candidate = nullptr) {
+    std::string cand;
+    bool haveCand = false;
+    size_t drop = 0;
+    if (candidate && !candidate->empty() && candidate->front() == '@') {
+        cand = *candidate;
+        haveCand = true;
+    }
+    std::string line;
+    while (true) {
+        if (haveCand) {
+            if (!reader.getline(line)) { header = cand; if (dropped) *dropped = drop; return true; } // header at EOF
+            if (isDnaLine(line)) { header = cand; reader.pushback(line); if (dropped) *dropped = drop; return true; }
+            ++drop; // rejected candidate
+            haveCand = false;
+        }
+        if (!reader.getline(line)) { if (dropped) *dropped = drop; return false; }
+        if (!line.empty() && line.front() == '@') { cand = line; haveCand = true; }
+        else ++drop;
+    }
+}
+
+// Reads up to maxRecords well-formed records. Malformed records are skipped
+// (with a warning) and reading continues at the next plausible record start.
+// `skipped` accumulates the number of malformed records dropped.
+static size_t readFastqChunk(FastqLineReader& reader, size_t maxRecords,
+                             std::vector<std::string>& readnames,
+                             std::vector<std::string>& reads,
+                             std::vector<std::string>& quals,
+                             size_t& skipped) {
     size_t count = 0;
-    auto trimCR = [](std::string& s) {
-        if (!s.empty() && s.back() == '\r') s.pop_back();
-    };
+    std::string header, sequence, plus, quality;
+    bool haveHeader = false;
     while (count < maxRecords) {
-        std::string line, sequence, plus, quality;
-        if (gzgets(gz, buf, sizeof(buf)) == nullptr) break;
-        line = buf;
-        if (!line.empty() && line.back() == '\n') line.pop_back();
-        trimCR(line);
-        if (line.empty() || line[0] != '@') break;
-        if (gzgets(gz, buf, sizeof(buf)) == nullptr) break;
-        sequence = buf;
-        if (!sequence.empty() && sequence.back() == '\n') sequence.pop_back();
-        trimCR(sequence);
-        if (gzgets(gz, buf, sizeof(buf)) == nullptr) break;
-        plus = buf;
-        if (!plus.empty() && plus.back() == '\n') plus.pop_back();
-        trimCR(plus);
-        if (plus.empty() || plus[0] != '+') break;
-        if (gzgets(gz, buf, sizeof(buf)) == nullptr) break;
-        quality = buf;
-        if (!quality.empty() && quality.back() == '\n') quality.pop_back();
-        trimCR(quality);
-        if (sequence.length() != quality.length()) break;
-        readnames.push_back(line);
+        if (!haveHeader) {
+            if (!reader.getline(header)) break;
+            if (header.empty() || header[0] != '@') {
+                // Out of sync (stray blank/junk line or drift after a skipped
+                // record): rescan for the next valid record start.
+                size_t dropped = 0;
+                if (!resyncToNextRecord(reader, header, &dropped)) break;
+                if (dropped > 0) {
+                    std::cerr << "\nWarning: lost sync in FASTQ; discarded " << dropped
+                              << " unparsable line(s) before the next record." << std::endl;
+                    ++skipped;
+                }
+            }
+            haveHeader = true;
+        }
+        if (!reader.getline(sequence)) break;
+        if (!reader.getline(plus)) break;
+        if (plus.empty() || plus[0] != '+') {
+            std::cerr << "\nWarning: malformed FASTQ at record \"" << header
+                      << "\" (missing '+' line); skipping this record." << std::endl;
+            ++skipped;
+            // Position is untrusted; resync. The '+' slot line may itself be a
+            // header (record that lost both seq and '+' lines), so try it.
+            size_t dropped = 0;
+            if (!resyncToNextRecord(reader, header, &dropped, &plus)) { haveHeader = false; break; }
+            if (dropped > 1) {
+                std::cerr << "\nWarning: discarded " << dropped
+                          << " further unparsable line(s) after record \"" << header << "\"." << std::endl;
+            }
+            continue; // header is set; read its seq/plus/qual
+        }
+        if (!reader.getline(quality)) break;
+        if (sequence.length() != quality.length()) {
+            std::cerr << "\nWarning: malformed FASTQ at record \"" << header
+                      << "\" (seq/qual length mismatch); skipping this record." << std::endl;
+            ++skipped;
+            haveHeader = false; // 4 lines consumed -> likely aligned at next record
+            continue;
+        }
+        readnames.push_back(header);
         reads.push_back(sequence);
         quals.push_back(quality);
         ++count;
+        haveHeader = false;
     }
     return count;
 }
 
-static size_t readPlainChunk(std::ifstream& ifs, size_t maxRecords,
-                             std::vector<std::string>& readnames,
-                             std::vector<std::string>& reads,
-                             std::vector<std::string>& quals) {
-    size_t count = 0;
-    std::string line;
-    auto trimCR = [](std::string& s) {
-        if (!s.empty() && s.back() == '\r') s.pop_back();
+// ─── Paired-end name alignment ───
+// Compare read names ignoring mate-number suffixes: trailing "/1" or "/2",
+// or a trailing " 1:" / " 2:" field (common Illumina conventions). No
+// allocation: trims both names in place before comparing.
+static bool sameBaseName(const std::string& a, const std::string& b) {
+    auto trim = [](const std::string& s) -> size_t {
+        size_t len = s.size();
+        if (len >= 2 && s[len - 2] == '/' && (s[len - 1] == '1' || s[len - 1] == '2'))
+            len -= 2;
+        else if (len >= 3 && s[len - 2] == ':' && (s[len - 1] == '1' || s[len - 1] == '2') && s[len - 3] == ' ')
+            len -= 3;
+        return len;
     };
-    while (count < maxRecords) {
-        if (!std::getline(ifs, line)) break;
-        trimCR(line);
-        if (line.empty() || line[0] != '@') break;
-        std::string readname = line;
-        if (!std::getline(ifs, line)) break;
-        trimCR(line);
-        std::string sequence = line;
-        if (!std::getline(ifs, line)) break;
-        trimCR(line);
-        if (line.empty() || line[0] != '+') break;
-        if (!std::getline(ifs, line)) break;
-        trimCR(line);
-        std::string quality = line;
-        if (sequence.length() != quality.length()) break;
-        readnames.push_back(readname);
-        reads.push_back(sequence);
-        quals.push_back(quality);
-        ++count;
-    }
-    return count;
+    size_t la = trim(a), lb = trim(b);
+    return la == lb && std::equal(a.begin(), a.begin() + la, b.begin());
 }
+
+// Find the entry in names[from..to) whose base name equals `name`; npos if none.
+static size_t findBaseName(const std::string& name,
+                           const std::vector<std::string>& names, size_t from, size_t to) {
+    for (size_t k = from; k < to; ++k)
+        if (sameBaseName(name, names[k])) return k;
+    return std::string::npos;
+}
+
+// ─── Streaming FASTQ writer: plain ofstream or gzwrite stream (fastp-style) ───
+class FastqWriter {
+private:
+    bool isGz_ = false;
+    gzFile gz_ = nullptr;
+    std::ofstream ofs_;
+public:
+    bool open(const std::string& path, bool gzipOut) {
+        isGz_ = gzipOut;
+        if (isGz_) {
+            gz_ = gzopen(path.c_str(), "wb6"); // level 6, like fastp default
+            return gz_ != nullptr;
+        }
+        ofs_.open(path, std::ios_base::binary);
+        return ofs_.is_open();
+    }
+    void write(const std::string& data) {
+        if (data.empty()) return;
+        if (isGz_) {
+            unsigned offset = 0;
+            while (offset < data.size()) {
+                int written = gzwrite(gz_, data.data() + offset,
+                                      static_cast<unsigned>(data.size() - offset));
+                if (written <= 0) {
+                    std::cerr << "Error: gzwrite failed" << std::endl;
+                    return;
+                }
+                offset += static_cast<unsigned>(written);
+            }
+        } else {
+            ofs_ << data;
+        }
+    }
+    void close() {
+        if (gz_) { gzclose(gz_); gz_ = nullptr; }
+        if (ofs_.is_open()) ofs_.close();
+    }
+    ~FastqWriter() { close(); }
+};
 
 class FastqProcessor {
 private:
@@ -378,13 +552,30 @@ private:
     bool partial;
     bool isPaired;
     int numThreads;
+    bool gzipOut;
+    FastqWriter writer1_, writer2_, writerSingle_;
+    bool writersOpen_ = false;
+
+    void ensureWritersOpen() {
+        if (writersOpen_) return;
+        auto fail = [](const std::string& p) {
+            std::cerr << "Error: Could not open output file: " << p << std::endl;
+            std::exit(1);
+        };
+        if (!writer1_.open(outputFile1, gzipOut)) fail(outputFile1);
+        if (isPaired) {
+            if (!writer2_.open(outputFile2, gzipOut)) fail(outputFile2);
+            if (!writerSingle_.open(singleOutputFile, gzipOut)) fail(singleOutputFile);
+        }
+        writersOpen_ = true;
+    }
 
 public:
     FastqProcessor(const std::string& out1, const std::string& out2,
                    const std::string& single,
                    const std::vector<AdapterInfo>& adapterInfos,
                    int matchLen, int minLen, int maxMismatchCount, int maxCosts,
-                   bool rc, bool p, int threads)
+                   bool rc, bool p, int threads, bool gzout = false)
         : outputFile1(out1), outputFile2(out2),
           singleOutputFile(single),
           adapterArray(adapterInfos),
@@ -395,15 +586,29 @@ public:
           recurse(rc),
           partial(p),
           isPaired(!out2.empty()),
-          numThreads(threads) {}
+          numThreads(threads),
+          gzipOut(gzout) {}
+
+    ~FastqProcessor() { closeWriters(); }
+
+    void closeWriters() {
+        if (!writersOpen_) return;
+        writer1_.close();
+        writer2_.close();
+        writerSingle_.close();
+        writersOpen_ = false;
+    }
 
     void processChunk(const std::vector<std::string>& readnames1,
                       const std::vector<std::string>& reads1,
                       const std::vector<std::string>& quals1,
                       const std::vector<std::string>& readnames2,
                       const std::vector<std::string>& reads2,
-                      const std::vector<std::string>& quals2) {
-        size_t total = readnames1.size();
+                      const std::vector<std::string>& quals2,
+                      const std::vector<std::string>& orphanNames = {},
+                      const std::vector<std::string>& orphanReads = {},
+                      const std::vector<std::string>& orphanQuals = {}) {
+        size_t total = readnames1.size() + orphanNames.size();
         if (total == 0) return;
         int numThreadsActual = std::min(numThreads, (int)total);
         if (numThreadsActual < 1) numThreadsActual = 1;
@@ -421,23 +626,18 @@ public:
                 recurse, partial, minReadLength,
                 std::cref(readnames1), std::cref(reads1), std::cref(quals1),
                 std::cref(readnames2), std::cref(reads2), std::cref(quals2),
+                std::cref(orphanNames), std::cref(orphanReads), std::cref(orphanQuals),
                 start, end, isPaired,
                 std::ref(results[t]));
         }
         for (auto& t : threads) t.join();
 
-        std::ofstream out1File(outputFile1, std::ios_base::app);
-        std::ofstream out2File;
-        std::ofstream singleFile;
-        if (isPaired) {
-            out2File.open(outputFile2, std::ios_base::app);
-            singleFile.open(singleOutputFile, std::ios_base::app);
-        }
+        ensureWritersOpen();
         for (int t = 0; t < numThreadsActual; ++t) {
-            out1File << results[t].out1;
+            writer1_.write(results[t].out1);
             if (isPaired) {
-                out2File << results[t].out2;
-                singleFile << results[t].singleOut;
+                writer2_.write(results[t].out2);
+                writerSingle_.write(results[t].singleOut);
             }
         }
 
@@ -479,35 +679,6 @@ public:
         std::cout << "Trimming statistics written to: " << filename << std::endl;
     }
 };
-
-// gzip compression (for output)
-namespace gzip_custom {
-std::string compress(const std::string& input) {
-    if (input.empty()) return "";
-    z_stream strm{};
-    strm.next_in  = reinterpret_cast<Bytef*>(const_cast<char*>(input.data()));
-    strm.avail_in = static_cast<uInt>(input.size());
-    if (deflateInit2(&strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
-                     16 + MAX_WBITS, 8, Z_DEFAULT_STRATEGY) != Z_OK)
-        throw std::runtime_error("deflateInit2 failed");
-    std::string output;
-    unsigned char buffer[64 * 1024];
-    int ret;
-    do {
-        strm.next_out  = buffer;
-        strm.avail_out = sizeof(buffer);
-        ret = deflate(&strm, strm.avail_in ? Z_NO_FLUSH : Z_FINISH);
-        if (ret == Z_STREAM_ERROR) {
-            deflateEnd(&strm);
-            throw std::runtime_error("deflate failed");
-        }
-        size_t have = sizeof(buffer) - strm.avail_out;
-        if (have) output.append(reinterpret_cast<const char*>(buffer), have);
-    } while (ret != Z_STREAM_END);
-    deflateEnd(&strm);
-    return output;
-}
-} // namespace gzip_custom
 
 // Read multi-FASTA adapter file
 std::vector<AdapterInfo> readAdaptersFromFASTA(const std::string& filename) {
@@ -594,7 +765,7 @@ int main(int argc, char* argv[]) {
                           << "-t num_threads (default: 1)\n"
                           << "-r trim recursively (default: false)\n"
                           << "-p trim partial adapters (default: false)\n"
-                          << "-g gzip output (default: false)\n";
+                          << "-g gzip output, streamed directly to .fastq.gz (default: false)\n";
                 return 1;
             default:
                 std::cerr << "Unknown option: " << char(opt) << "\n";
@@ -615,10 +786,12 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    outputFile1 = outputFile1 + ".fastq";
+    std::string outputExt = gzipout ? ".fastq.gz" : ".fastq";
+    std::string statsFile = outputFile1 + "_trimming_stats.txt";
+    outputFile1 = outputFile1 + outputExt;
     if (!outputFile2.empty()) {
-        outputFile2 = outputFile2 + ".fastq";
-        singleOutputFile = singleOutputFile + ".fastq";
+        outputFile2 = outputFile2 + outputExt;
+        singleOutputFile = singleOutputFile + outputExt;
     }
 
     std::cout << "Configuration:\n"
@@ -656,29 +829,23 @@ int main(int argc, char* argv[]) {
     bool input1IsGzip = isGzipFile(inputFile1);
     bool input2IsGzip = inputFile2.empty() ? false : isGzipFile(inputFile2);
 
-    gzFile gz1 = nullptr, gz2 = nullptr;
-    std::ifstream ifs1, ifs2;
-
+    FastqLineReader reader1, reader2;
     if (input1IsGzip) {
-        gz1 = gzopen(inputFile1.c_str(), "rb");
-        if (!gz1) { std::cerr << "Error: Could not open gzip: " << inputFile1 << std::endl; return 1; }
+        if (!reader1.openGz(inputFile1)) { std::cerr << "Error: Could not open gzip: " << inputFile1 << std::endl; return 1; }
     } else {
-        ifs1.open(inputFile1, std::ios_base::binary);
-        if (!ifs1) { std::cerr << "Error: Could not open: " << inputFile1 << std::endl; return 1; }
+        if (!reader1.openPlain(inputFile1)) { std::cerr << "Error: Could not open: " << inputFile1 << std::endl; return 1; }
     }
     if (!inputFile2.empty()) {
         if (input2IsGzip) {
-            gz2 = gzopen(inputFile2.c_str(), "rb");
-            if (!gz2) { std::cerr << "Error: Could not open gzip: " << inputFile2 << std::endl; return 1; }
+            if (!reader2.openGz(inputFile2)) { std::cerr << "Error: Could not open gzip: " << inputFile2 << std::endl; return 1; }
         } else {
-            ifs2.open(inputFile2, std::ios_base::binary);
-            if (!ifs2) { std::cerr << "Error: Could not open: " << inputFile2 << std::endl; return 1; }
+            if (!reader2.openPlain(inputFile2)) { std::cerr << "Error: Could not open: " << inputFile2 << std::endl; return 1; }
         }
     }
 
     FastqProcessor processor(outputFile1, outputFile2, singleOutputFile,
                              adapterArray, matchLength, minReadLength,
-                             maxMismatches, maxMismatchCost, recurse, partial, numThreads);
+                             maxMismatches, maxMismatchCost, recurse, partial, numThreads, gzipout);
 
     size_t recordsPerChunk = static_cast<size_t>(numThreads) * 100000ULL;
     bool isPaired = !inputFile2.empty();
@@ -696,64 +863,148 @@ int main(int argc, char* argv[]) {
         removeIfExists(outputFile2);
         removeIfExists(singleOutputFile);
     }
-    std::string statsFile = outputFile1.substr(0, outputFile1.find_last_of('.')) + "_trimming_stats.txt";
     removeIfExists(statsFile);
-    std::vector<std::string> chunkReadnames1, chunkReads1, chunkQuals1;
-    std::vector<std::string> chunkReadnames2, chunkReads2, chunkQuals2;
+    std::vector<std::string> chunkN1, chunkR1, chunkQ1, chunkN2, chunkR2, chunkQ2;
+    // Carry-over buffers: records whose mates are not loaded yet (one side may
+    // run ahead of the other after malformed records are skipped).
+    std::vector<std::string> pendN1, pendR1, pendQ1, pendN2, pendR2, pendQ2;
     size_t totalProcessed = 0;
+    size_t totalSkipped = 0;
+    size_t totalOrphans = 0;
+    size_t orphanWarnings = 0;
+    bool eof1 = false, eof2 = false;
+    bool positional = false, nameModeChecked = false;
 
     while (true) {
-        chunkReadnames1.clear(); chunkReads1.clear(); chunkQuals1.clear();
-        chunkReadnames2.clear(); chunkReads2.clear(); chunkQuals2.clear();
+        chunkN1.clear(); chunkR1.clear(); chunkQ1.clear();
+        chunkN2.clear(); chunkR2.clear(); chunkQ2.clear();
 
-        size_t n1 = input1IsGzip
-            ? readGzipChunk(gz1, recordsPerChunk, chunkReadnames1, chunkReads1, chunkQuals1)
-            : readPlainChunk(ifs1, recordsPerChunk, chunkReadnames1, chunkReads1, chunkQuals1);
-        if (n1 == 0) break;
+        size_t n1 = readFastqChunk(reader1, recordsPerChunk, chunkN1, chunkR1, chunkQ1, totalSkipped);
+        if (n1 < recordsPerChunk) eof1 = true;
 
-        if (isPaired) {
-            size_t n2 = input2IsGzip
-                ? readGzipChunk(gz2, n1, chunkReadnames2, chunkReads2, chunkQuals2)
-                : readPlainChunk(ifs2, n1, chunkReadnames2, chunkReads2, chunkQuals2);
-            if (n2 != n1) {
-                std::cerr << "Warning: Mismatched count in pair-end chunk (" << n1 << " vs " << n2 << ")" << std::endl;
-                size_t minN = std::min(n1, n2);
-                chunkReadnames1.resize(minN); chunkReads1.resize(minN); chunkQuals1.resize(minN);
-                chunkReadnames2.resize(minN); chunkReads2.resize(minN); chunkQuals2.resize(minN);
-            }
+        if (!isPaired) {
+            if (n1 == 0) break; // 0 = true EOF (bad records are skipped internally)
+            processor.processChunk(chunkN1, chunkR1, chunkQ1, chunkN2, chunkR2, chunkQ2);
+            totalProcessed += n1;
+            std::cout << "\rProcessed " << totalProcessed << " reads" << std::flush;
+            continue;
         }
 
-        processor.processChunk(chunkReadnames1, chunkReads1, chunkQuals1,
-                              chunkReadnames2, chunkReads2, chunkQuals2);
-        totalProcessed += chunkReadnames1.size();
+        size_t n2 = readFastqChunk(reader2, recordsPerChunk, chunkN2, chunkR2, chunkQ2, totalSkipped);
+        if (n2 < recordsPerChunk) eof2 = true;
+
+        pendN1.insert(pendN1.end(), chunkN1.begin(), chunkN1.end());
+        pendR1.insert(pendR1.end(), chunkR1.begin(), chunkR1.end());
+        pendQ1.insert(pendQ1.end(), chunkQ1.begin(), chunkQ1.end());
+        pendN2.insert(pendN2.end(), chunkN2.begin(), chunkN2.end());
+        pendR2.insert(pendR2.end(), chunkR2.begin(), chunkR2.end());
+        pendQ2.insert(pendQ2.end(), chunkQ2.begin(), chunkQ2.end());
+
+        // One-time check: do the two files share read names? If not, fall back
+        // to positional pairing so unrelated naming conventions still work.
+        if (!nameModeChecked && pendN1.size() >= 2 && pendN2.size() >= 2) {
+            size_t chk = std::min(std::min(pendN1.size(), pendN2.size()), static_cast<size_t>(1000));
+            size_t matches = 0;
+            for (size_t k = 0; k < chk; ++k)
+                if (sameBaseName(pendN1[k], pendN2[k])) ++matches;
+            if (matches * 10 < chk) {
+                positional = true;
+                std::cerr << "\nWarning: read names do not correspond between -i and -I; "
+                             "falling back to positional pairing." << std::endl;
+            }
+            nameModeChecked = true;
+        }
+
+        std::vector<std::string> pairN1, pairR1, pairQ1, pairN2, pairR2, pairQ2;
+        std::vector<std::string> orphN, orphR, orphQ;
+
+        auto warnOrphan = [&](const std::string& nm) {
+            if (orphanWarnings < 10) {
+                ++orphanWarnings;
+                std::cerr << "\nWarning: mate of \"" << nm
+                          << "\" was lost; writing it to single output." << std::endl;
+            }
+        };
+        auto orphanFrom1 = [&](size_t a, size_t b) {
+            for (size_t k = a; k < b; ++k) { warnOrphan(pendN1[k]);
+                orphN.push_back(std::move(pendN1[k])); orphR.push_back(std::move(pendR1[k])); orphQ.push_back(std::move(pendQ1[k])); }
+        };
+        auto orphanFrom2 = [&](size_t a, size_t b) {
+            for (size_t k = a; k < b; ++k) { warnOrphan(pendN2[k]);
+                orphN.push_back(std::move(pendN2[k])); orphR.push_back(std::move(pendR2[k])); orphQ.push_back(std::move(pendQ2[k])); }
+        };
+
+        size_t i = 0, j = 0;
+        const size_t s1 = pendN1.size(), s2 = pendN2.size();
+
+        if (positional) {
+            size_t m = std::min(s1, s2);
+            for (size_t k = 0; k < m; ++k) {
+                pairN1.push_back(std::move(pendN1[k])); pairR1.push_back(std::move(pendR1[k])); pairQ1.push_back(std::move(pendQ1[k]));
+                pairN2.push_back(std::move(pendN2[k])); pairR2.push_back(std::move(pendR2[k])); pairQ2.push_back(std::move(pendQ2[k]));
+            }
+            i = m; j = m;
+            if (eof2) { orphanFrom1(i, s1); i = s1; }
+            if (eof1) { orphanFrom2(j, s2); j = s2; }
+        } else {
+            // Name-based alignment: both files preserve the same record order,
+            // so mismatches come from records skipped as malformed on one side.
+            while (i < s1 && j < s2) {
+                if (sameBaseName(pendN1[i], pendN2[j])) {
+                    pairN1.push_back(std::move(pendN1[i])); pairR1.push_back(std::move(pendR1[i])); pairQ1.push_back(std::move(pendQ1[i]));
+                    pairN2.push_back(std::move(pendN2[j])); pairR2.push_back(std::move(pendR2[j])); pairQ2.push_back(std::move(pendQ2[j]));
+                    ++i; ++j;
+                } else {
+                    size_t k = findBaseName(pendN1[i], pendN2, j + 1, s2);
+                    if (k != std::string::npos) {
+                        orphanFrom2(j, k); j = k; // pendN1[i]'s mate is at k; j..k-1 are orphans
+                    } else {
+                        size_t l = findBaseName(pendN2[j], pendN1, i + 1, s1);
+                        if (l != std::string::npos) {
+                            orphanFrom1(i, l); i = l;
+                        } else if (eof1 && eof2) {
+                            orphanFrom1(i, i + 1); ++i; orphanFrom2(j, j + 1); ++j;
+                        } else if (eof2) {
+                            orphanFrom1(i, i + 1); ++i; // no more R2 data will arrive
+                        } else if (eof1) {
+                            orphanFrom2(j, j + 1); ++j; // no more R1 data will arrive
+                        } else {
+                            break; // mates may still arrive in later chunks; wait
+                        }
+                    }
+                }
+            }
+            if (i < s1 && eof2) { orphanFrom1(i, s1); i = s1; }
+            if (j < s2 && eof1) { orphanFrom2(j, s2); j = s2; }
+        }
+
+        auto erasePrefix = [](std::vector<std::string>& v, size_t n) {
+            v.erase(v.begin(), v.begin() + n);
+        };
+        erasePrefix(pendN1, i); erasePrefix(pendR1, i); erasePrefix(pendQ1, i);
+        erasePrefix(pendN2, j); erasePrefix(pendR2, j); erasePrefix(pendQ2, j);
+
+        totalOrphans += orphN.size();
+        processor.processChunk(pairN1, pairR1, pairQ1, pairN2, pairR2, pairQ2, orphN, orphR, orphQ);
+        totalProcessed += pairN1.size() + orphN.size();
         std::cout << "\rProcessed " << totalProcessed << " reads" << std::flush;
+
+        if (eof1 && eof2 && pendN1.empty() && pendN2.empty()) break;
+        if (n1 == 0 && n2 == 0 && pendN1.empty() && pendN2.empty()) break; // safety
     }
     std::cout << "\nCompleted" << std::endl;
+    if (totalSkipped > 0)
+        std::cout << "Skipped " << totalSkipped << " malformed record(s); remaining reads were output normally." << std::endl;
+    if (totalOrphans > 0)
+        std::cout << "Orphaned mates (partner lost) written to single output: " << totalOrphans << std::endl;
 
-    if (input1IsGzip) gzclose(gz1);
-    if (!inputFile2.empty() && input2IsGzip) gzclose(gz2);
+    reader1.close();
+    reader2.close();
+    processor.closeWriters();
 
     processor.printTrimStats();
 
     processor.writeTrimStatsToFile(statsFile);
-
-    auto compressAndWrite = [](const std::string& f) {
-        size_t size = std::filesystem::file_size(f);
-        std::vector<char> buffer(size);
-        std::ifstream ifs(f, std::ios_base::binary);
-        ifs.read(buffer.data(), size); ifs.close();
-        std::string compressed = gzip_custom::compress(std::string(buffer.data(), size));
-        std::ofstream ofs(f + ".gz", std::ios_base::binary);
-        ofs << compressed; ofs.close();
-        std::filesystem::remove(f);
-    };
-
-    if (gzipout) {
-        std::cout << "Compressing output files" << std::endl;
-        if (!outputFile1.empty() && std::filesystem::exists(outputFile1)) compressAndWrite(outputFile1);
-        if (!outputFile2.empty() && std::filesystem::exists(outputFile2)) compressAndWrite(outputFile2);
-        if (!singleOutputFile.empty() && std::filesystem::exists(singleOutputFile)) compressAndWrite(singleOutputFile);
-    }
 
     return 0;
 }
