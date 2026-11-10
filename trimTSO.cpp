@@ -34,6 +34,7 @@ private:
     };
 
     std::vector<AdapterInfo> adapterArray;
+    std::vector<std::string> rcAdapterArray; // 各アダプタの相補鎖(RC)
     int matchLength;
     int maxMismatches;
     int maxMismatchCost;
@@ -112,9 +113,31 @@ private:
         return dp[len1][len2];
     }
 
+    // アダプタ順配向と相補鎖(RC)の両方を照合し、小さい方のミスマッチ数を返す
+    int matchMismatchCount(const std::string& adapterEnd, const std::string& rcAdapterEnd, const std::string& toMatch) {
+        if (maxMismatchCost > 0) {
+            int cost = calculateEditDistance(adapterEnd, toMatch);
+            if (cost <= maxMismatchCost) return cost;
+            int rcCost = calculateEditDistance(rcAdapterEnd, toMatch);
+            return std::min(cost, rcCost);
+        }
+        int mismatches = 0;
+        for (size_t i = 0; i < toMatch.length(); ++i)
+            mismatches += calculateBaseDistance(toMatch[i], adapterEnd[i]);
+        if (mismatches <= maxMismatches) return mismatches;
+        int rcMismatches = 0;
+        for (size_t i = 0; i < toMatch.length(); ++i)
+            rcMismatches += calculateBaseDistance(toMatch[i], rcAdapterEnd[i]);
+        return std::min(mismatches, rcMismatches);
+    }
+
 public:
     AdapterTrimmer(const std::vector<AdapterInfo>& adapterInfos, int matchLen = 8, int maxMismatchCount = 0, int maxCosts = 0, bool rc = false, bool p = false)
-        : adapterArray(adapterInfos), matchLength(matchLen), maxMismatches(maxMismatchCount), maxMismatchCost(maxCosts), recurse(rc), partial(p) {}
+        : adapterArray(adapterInfos), matchLength(matchLen), maxMismatches(maxMismatchCount), maxMismatchCost(maxCosts), recurse(rc), partial(p) {
+        rcAdapterArray.reserve(adapterArray.size());
+        for (const auto& a : adapterArray)
+            rcAdapterArray.push_back(reverseComplement(a.sequence));
+    }
 
     std::pair<std::string, std::string> trimAdapters(const std::string& sequence, const std::string& quality) {
         if (sequence.empty() || quality.empty()) return {sequence, quality};
@@ -185,13 +208,10 @@ private:
                 for (int x = static_cast<int>(adapter.length()); x >= matchLength; --x) {
                     if (trimmedSeq.length() >= static_cast<size_t>(x)) {
                         std::string adapterEnd = adapter.substr(adapter.length() - x);
+                        // 相補鎖側: RC(adapterの3'末端x塩基) = rcAdapterの5'側x塩基
+                        std::string rcAdapterEnd = rcAdapterArray[adapterIdx].substr(0, x);
                         std::string toMatch = trimmedSeq.substr(0, x);
-                        int mismatches = 0;
-                        if (maxMismatchCost > 0)
-                            mismatches = calculateEditDistance(adapterEnd, toMatch);
-                        else
-                            for (size_t i = 0; i < toMatch.length(); ++i)
-                                mismatches += calculateBaseDistance(toMatch[i], adapterEnd[i]);
+                        int mismatches = matchMismatchCount(adapterEnd, rcAdapterEnd, toMatch);
                         bool shouldTrim = (maxMismatchCost > 0) ? (mismatches <= maxMismatchCost) : (mismatches <= maxMismatches);
                         if (shouldTrim) {
                             trimmedSeq = trimmedSeq.substr(x);
@@ -208,13 +228,10 @@ private:
                     if (trimmedSeq.length() >= static_cast<size_t>(x)) {
                         for (size_t y = 0; y <= adapter.length() - x; ++y) {
                             std::string adapterSub = adapter.substr(y, x);
+                            // 相補鎖側: RC(adapterの部分配列) = rcAdapterの対応スライス
+                            std::string rcAdapterSub = rcAdapterArray[adapterIdx].substr(rcAdapterArray[adapterIdx].length() - y - x, x);
                             std::string toMatch = trimmedSeq.substr(0, x);
-                            int mismatches = 0;
-                            if (maxMismatchCost > 0)
-                                mismatches = calculateEditDistance(adapterSub, toMatch);
-                            else
-                                for (size_t i = 0; i < toMatch.length(); ++i)
-                                    mismatches += calculateBaseDistance(toMatch[i], adapterSub[i]);
+                            int mismatches = matchMismatchCount(adapterSub, rcAdapterSub, toMatch);
                             bool shouldTrim = (maxMismatchCost > 0) ? (mismatches <= maxMismatchCost) : (mismatches <= maxMismatches);
                             if (shouldTrim) {
                                 trimmedSeq = trimmedSeq.substr(x);
