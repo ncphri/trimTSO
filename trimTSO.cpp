@@ -34,7 +34,6 @@ private:
     };
 
     std::vector<AdapterInfo> adapterArray;
-    std::vector<std::string> rcAdapterArray; // 各アダプタの相補鎖(RC)
     int matchLength;
     int maxMismatches;
     int maxMismatchCost;
@@ -113,12 +112,13 @@ private:
         return dp[len1][len2];
     }
 
-    // 順配向/相補鎖 × 末端側/先頭側 スライスの最小ミスマッチ数
-    int matchMismatchCount(const std::string& adapterEnd, const std::string& rcAdapterEnd,
-                           const std::string& adapterHead, const std::string& rcAdapterHead,
+    // 末端側/先頭側 スライスの最小ミスマッチ数
+    // (相補鎖側の照合は trimAdapters のRCビューパスが担う。実データで5'RC/3'fwdの
+    //  交差候補は誤トリムのみ実測(2026-11-10 S5)のため廃止)
+    int matchMismatchCount(const std::string& adapterEnd, const std::string& adapterHead,
                            const std::string& toMatch) {
         int best = 1 << 30;
-        for (const std::string* cand : {&adapterEnd, &rcAdapterEnd, &adapterHead, &rcAdapterHead}) {
+        for (const std::string* cand : {&adapterEnd, &adapterHead}) {
             if (maxMismatchCost > 0) {
                 int cost = calculateEditDistance(*cand, toMatch);
                 if (cost < best) best = cost;
@@ -137,9 +137,6 @@ private:
 public:
     AdapterTrimmer(const std::vector<AdapterInfo>& adapterInfos, int matchLen = 8, int maxMismatchCount = 0, int maxCosts = 0, bool rc = false, bool p = false)
         : adapterArray(adapterInfos), matchLength(matchLen), maxMismatches(maxMismatchCount), maxMismatchCost(maxCosts), recurse(rc), partial(p) {
-        rcAdapterArray.reserve(adapterArray.size());
-        for (const auto& a : adapterArray)
-            rcAdapterArray.push_back(reverseComplement(a.sequence));
     }
 
     std::pair<std::string, std::string> trimAdapters(const std::string& sequence, const std::string& quality) {
@@ -211,13 +208,10 @@ private:
                 for (int x = static_cast<int>(adapter.length()); x >= matchLength; --x) {
                     if (trimmedSeq.length() >= static_cast<size_t>(x)) {
                         std::string adapterEnd = adapter.substr(adapter.length() - x);
-                        // 相補鎖側: RC(adapterの3'末端x塩基) = rcAdapterの5'側x塩基
-                        std::string rcAdapterEnd = rcAdapterArray[adapterIdx].substr(0, x);
-                        // 先頭側: adapterの5'末端x塩基 と そのRC(R[a:30]型断片のRCビュー対応)
+                        // 先頭側: adapterの5'末端x塩基 (RCビューでのR先端断片=3'パス側で照合)
                         std::string adapterHead = adapter.substr(0, x);
-                        std::string rcAdapterHead = rcAdapterArray[adapterIdx].substr(rcAdapterArray[adapterIdx].length() - x, x);
                         std::string toMatch = trimmedSeq.substr(0, x);
-                        int mismatches = matchMismatchCount(adapterEnd, rcAdapterEnd, adapterHead, rcAdapterHead, toMatch);
+                        int mismatches = matchMismatchCount(adapterEnd, adapterHead, toMatch);
                         bool shouldTrim = (maxMismatchCost > 0) ? (mismatches <= maxMismatchCost) : (mismatches <= maxMismatches);
                         if (shouldTrim) {
                             trimmedSeq = trimmedSeq.substr(x);
@@ -240,10 +234,9 @@ private:
                     if (trimmedSeq.length() >= static_cast<size_t>(x)) {
                         for (size_t y = 0; y <= adapter.length() - x; ++y) {
                             std::string adapterSub = adapter.substr(y, x);
-                            // 相補鎖側: RC(adapterの部分配列) = rcAdapterの対応スライス
-                            std::string rcAdapterSub = rcAdapterArray[adapterIdx].substr(rcAdapterArray[adapterIdx].length() - y - x, x);
                             std::string toMatch = trimmedSeq.substr(0, x);
-                            int mismatches = matchMismatchCount(adapterSub, rcAdapterSub, adapterSub, rcAdapterSub, toMatch);
+                            // 部分配列は順配向のみ(候補スライスを両引数に渡す)
+                            int mismatches = matchMismatchCount(adapterSub, adapterSub, toMatch);
                             bool shouldTrim = (maxMismatchCost > 0) ? (mismatches <= maxMismatchCost) : (mismatches <= maxMismatches);
                             if (shouldTrim) {
                                 trimmedSeq = trimmedSeq.substr(x);
