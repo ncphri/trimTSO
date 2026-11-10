@@ -113,22 +113,25 @@ private:
         return dp[len1][len2];
     }
 
-    // アダプタ順配向と相補鎖(RC)の両方を照合し、小さい方のミスマッチ数を返す
-    int matchMismatchCount(const std::string& adapterEnd, const std::string& rcAdapterEnd, const std::string& toMatch) {
-        if (maxMismatchCost > 0) {
-            int cost = calculateEditDistance(adapterEnd, toMatch);
-            if (cost <= maxMismatchCost) return cost;
-            int rcCost = calculateEditDistance(rcAdapterEnd, toMatch);
-            return std::min(cost, rcCost);
+    // 順配向/相補鎖 × 末端側/先頭側 スライスの最小ミスマッチ数
+    int matchMismatchCount(const std::string& adapterEnd, const std::string& rcAdapterEnd,
+                           const std::string& adapterHead, const std::string& rcAdapterHead,
+                           const std::string& toMatch) {
+        int best = 1 << 30;
+        for (const std::string* cand : {&adapterEnd, &rcAdapterEnd, &adapterHead, &rcAdapterHead}) {
+            if (maxMismatchCost > 0) {
+                int cost = calculateEditDistance(*cand, toMatch);
+                if (cost < best) best = cost;
+                if (best == 0) break;
+            } else {
+                int mismatches = 0;
+                for (size_t i = 0; i < toMatch.length(); ++i)
+                    mismatches += calculateBaseDistance(toMatch[i], (*cand)[i]);
+                if (mismatches < best) best = mismatches;
+                if (best == 0) break;
+            }
         }
-        int mismatches = 0;
-        for (size_t i = 0; i < toMatch.length(); ++i)
-            mismatches += calculateBaseDistance(toMatch[i], adapterEnd[i]);
-        if (mismatches <= maxMismatches) return mismatches;
-        int rcMismatches = 0;
-        for (size_t i = 0; i < toMatch.length(); ++i)
-            rcMismatches += calculateBaseDistance(toMatch[i], rcAdapterEnd[i]);
-        return std::min(mismatches, rcMismatches);
+        return best;
     }
 
 public:
@@ -210,8 +213,11 @@ private:
                         std::string adapterEnd = adapter.substr(adapter.length() - x);
                         // 相補鎖側: RC(adapterの3'末端x塩基) = rcAdapterの5'側x塩基
                         std::string rcAdapterEnd = rcAdapterArray[adapterIdx].substr(0, x);
+                        // 先頭側: adapterの5'末端x塩基 と そのRC(R[a:30]型断片のRCビュー対応)
+                        std::string adapterHead = adapter.substr(0, x);
+                        std::string rcAdapterHead = rcAdapterArray[adapterIdx].substr(rcAdapterArray[adapterIdx].length() - x, x);
                         std::string toMatch = trimmedSeq.substr(0, x);
-                        int mismatches = matchMismatchCount(adapterEnd, rcAdapterEnd, toMatch);
+                        int mismatches = matchMismatchCount(adapterEnd, rcAdapterEnd, adapterHead, rcAdapterHead, toMatch);
                         bool shouldTrim = (maxMismatchCost > 0) ? (mismatches <= maxMismatchCost) : (mismatches <= maxMismatches);
                         if (shouldTrim) {
                             trimmedSeq = trimmedSeq.substr(x);
@@ -224,26 +230,36 @@ private:
                 }
             }
             if (!trimmed && partial) {
-                for (int x = matchLength; x < static_cast<int>(adapter.length()); ++x) {
+                // -r時は連鎖的に食べ続ける(連結体対応)。ガード: 連鎖継続は「0ミスマッチ」または「x >= 2*matchLength」
+                bool again = true;
+                do {
+                again = false;
+                trimmed = false;
+                // 最長一致優先(降順)で照合
+                for (int x = static_cast<int>(adapter.length()) - 1; x >= matchLength; --x) {
                     if (trimmedSeq.length() >= static_cast<size_t>(x)) {
                         for (size_t y = 0; y <= adapter.length() - x; ++y) {
                             std::string adapterSub = adapter.substr(y, x);
                             // 相補鎖側: RC(adapterの部分配列) = rcAdapterの対応スライス
                             std::string rcAdapterSub = rcAdapterArray[adapterIdx].substr(rcAdapterArray[adapterIdx].length() - y - x, x);
                             std::string toMatch = trimmedSeq.substr(0, x);
-                            int mismatches = matchMismatchCount(adapterSub, rcAdapterSub, toMatch);
+                            int mismatches = matchMismatchCount(adapterSub, rcAdapterSub, adapterSub, rcAdapterSub, toMatch);
                             bool shouldTrim = (maxMismatchCost > 0) ? (mismatches <= maxMismatchCost) : (mismatches <= maxMismatches);
                             if (shouldTrim) {
                                 trimmedSeq = trimmedSeq.substr(x);
                                 trimmedQual = trimmedQual.substr(x);
                                 usedAdapterIndex = adapterIdx;
-                                if (recurse) trimmed = true;
+                                if (recurse) {
+                                    trimmed = true;
+                                    again = (mismatches == 0) || (x >= 2 * matchLength);
+                                }
                                 break;
                             }
                         }
                         if (trimmed) break;
                     }
                 }
+                } while (again && trimmedSeq.length() >= static_cast<size_t>(matchLength));
             }
         }
         return {trimmedSeq, trimmedQual, usedAdapterIndex};
