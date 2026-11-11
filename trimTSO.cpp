@@ -145,13 +145,13 @@ private:
     //   fwd断片 = 挿入は断片の3'側 → 断片右端eで5'側を一括破棄(3'フランク保持)
     //   RC断片  = 挿入は断片の5'側 → 断片左端sで3'側を一括破棄(5'フランク保持)
     // シード長=clamp(round(seedRatio*アダプタ長), seedFloor, アダプタ長)。
-    // アダプタ長<seedFloorのときは全長完全一致のみで検出(mmCap延長なし=誤発火抑止)。
+    // アダプタ長<seedFloorのときは全長一致(-n許容)で検出(mmCap延長なし)。
     // 保持フランク<kKeepFlankの発火は触らない(端パスの担当)。
     // 戻り値: 切断した断片数(0=検出なし)
     int internalTrim(std::string& seq, std::string& qual) {
         if (!internalEnable || seq.length() < 40) return 0;
         int frags = 0;
-        for (int iter = 0; iter < 4; ++iter) {   // 左から1断片切り→再走査。鎖は1回で全域除去
+        while (true) {   // 左から1断片切り→再走査(上限なし)。1切断ごとにリードはseedFloor(≥4)bp以上短くなるので必ず停止
             bool cut = false;
             for (size_t adapterIdx = 0; adapterIdx < adapterArray.size() && !cut; ++adapterIdx) {
                 const std::string& A = adapterArray[adapterIdx].sequence;
@@ -165,9 +165,9 @@ private:
                     const std::string& ref = refs[o];
                     for (int i = 0; i + seedLen <= alen && !cut; ++i) {   // fullOnlyなら1窓(=全長)
                         // 案B: シード窓ごとにミスマッチ数を数える走査。許容=maxMismatches(-n)。
-                        // fullOnly は 0mm 固定(完全一致のまま)。許容内の窓はミスマッチ最少優先・
-                        // 同数は最左の順に試す(allow=0 で旧 find() 完全一致最左走査と等価)。
-                        const int allow = fullOnly ? 0 : maxMismatches;
+                        // 全長一致経路(短アダプタ)も -n 許容。許容内の窓はミスマッチ最少優先・
+                        // 同数は最左の順に試す。
+                        const int allow = maxMismatches;
                         const int nWin = (int)seq.length() - seedLen + 1;
                         std::vector<std::pair<int,int>> cand;   // (p, seedMm)
                         for (int mm0 = 0; mm0 <= allow; ++mm0) {

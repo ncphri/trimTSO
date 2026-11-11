@@ -2,12 +2,9 @@ Library amplification using SMART-9N causes repeated insertion of TSO adapter su
 
 This tool is also useful for adapter/primer trimming as it recognizes and trims adapter sequences from the read ends.
 
-
-
 Compile
 
 g++ -std=c++17 trimTSO.cpp -lz -pthread -O3 -o trimTSO
-
 
 Usage
 
@@ -15,85 +12,65 @@ Usage
 
 Recommended run (with internal TSO trimming enabled):
 
-    ./trimTSO -i R1.fastq.gz -I R2.fastq.gz -o out_F -O out_R -s single -f adapters.fa -m 8 -n 1 -l 50 -r -p -g -x
+    ./trimTSO -i R1.fastq.gz -I R2.fastq.gz -o out_F -O out_R -s single -f adapters.fa -m 8 -n 1 -l 50 -r -p -g -x -t 4
 
 
 Internal TSO trimming (-x)
 --------------------------
 
-ライブラリ増幅の過程で read 内部に滑入した TSO 由来のアダプタ断片（内部キメラ）は、既存のread 末端照合によるトリムでは除去できません。`-x` を指定すると、リード全長を走査してアダプタ本体 (fwd) とその逆相補 (RC) の両方を内部検出し、断片を一括破棄します。`-x` なしの動作は従来版とバイト同一です（回帰検証済み）。
+Adapter-derived fragments that slipped into the interior of a read during amplification (internal chimeras) cannot be removed by the existing end-anchored trimming, which only matches adapter sequences at the read ends. With `-x`, the tool scans the full length of each read and detects both the adapter itself (fwd) and its reverse complement (RC) internally, discarding the fragment wholesale. Without `-x`, the tool performs only end trimming (no internal scan).
 
-### オプション
+### Options
 
-| オプション | 既定値 | 説明 |
+| Option | Default | Description |
 |---|---|---|
-| `-x` | 無効 | 内部TSOトリムを有効化（boolean） |
-| `-R 比` | 0.7 | シード長 = round(比 × アダプタ長)。`-x` 有効時のみ 0 超 1 以下の範囲チェック |
-| `-F bp` | 18 | シード長下限 (seedFloor)。`-x` 有効時のみ 4 以上の範囲チェック |
+| `-x` | off | Enable internal TSO trimming (boolean) |
+| `-R ratio` | 0.7 | Seed length = round(ratio × adapter length). Range-checked (0 < r ≤ 1) only when `-x` is active |
+| `-F bp` | 18 | Seed-length floor (seedFloor). Range-checked (≥ 4) only when `-x` is active |
 
-`-m` のコード既定値は 8 です。これまで本番パイプラインは明示的に `-m 5` を渡していましたが、今回運用を `-m 8` に変更します（`-m` / `-n` はチューニング領域であり、運用フラグ指定として扱います。根拠: `-m 5` ではアダプタと部分一致する 7bp 以下の短スライスが端パスの連鎖で偶然発火し純挿入端を喫食する — 挿入単独アンカー 80bp が 67bp まで削られた実測あり。`-m 8` で解消）。
+On `-m`: the code default is 8. With smaller match lengths (e.g. 5), short slices of the adapter (≤ 7 bp) can fire by chance in the partial-matching chain of the end-trim path and nibble into pure-insert ends: a pure-insert anchor read of 80 bp was measured to be reduced to 67 bp under such a setting. `-m 8` eliminates this. `-m` and `-n` are tuning knobs; adjust them as operation parameters rather than changing the code.
 
-### 検出機構
+### Detection mechanism
 
-- シード長 = clamp(round(`-R` × アダプタ長), `-F`, アダプタ長)。既定では 30bp アダプタで 21bp。
-- シード走査はミスマッチ許容 = `-n` 値（ハードキャップなし）。許容内の候補窓はミスマッチ最少優先・同数は最左の順に試します（`-n 0` は従来実装の完全一致最左走査と等価）。
-- シード位置から断片端方向へ延長し、切断領域の総ミスマッチ（シード + 延長）が `-n` 値 + mmCap 以内に収まる位置で切断します。mmCap = max(1, round(0.1 × アダプタ長))（30bp アダプタで 3）。停止基準を超えるミスマッチは消費せず、断片にも含めません。
-- 1 断片切断ごとに再走査（最大 4 周）。リード長 40bp 未満のリードは内部走査しません（断片長 40bp 未満は検出対象外）。
+- Seed length = clamp(round(`-R` × adapter length), `-F`, adapter length). With a 30 bp adapter and the defaults this is 21 bp.
+- The seed scan tolerates mismatches up to the `-n` value (no hard cap). Candidate windows within tolerance are tried fewest-mismatches first, ties broken by the leftmost position.
+- From the seed position the fragment is extended toward its remaining end, and the cut is made where the total mismatches in the cut region (seed + extension) stay within `-n` + mmCap. mmCap = max(1, round(0.1 × adapter length)) — 3 for a 30 bp adapter. Mismatches beyond the stopping criterion are neither consumed nor included in the fragment.
+- The scan is repeated after each fragment cut until no further fragment is found (no cap on the number of passes; each cut shortens the read by at least the seed floor, so the scan always terminates). Reads shorter than 40 bp are not scanned internally (fragments shorter than 40 bp are out of scope).
 
-### 短アダプタ（アダプタ長が seedFloor 未満）
+### Short adapters (adapter shorter than seedFloor)
 
-アダプタ長が `-F` 未満のアダプタは全長完全一致のみで検出します（mmCap 延長なし・0mm 固定）。変異断片は残存しますが、誤発火抑止を優先した既知の設計上の限界です。
+Adapters shorter than `-F` are detected by full-length match tolerating up to `-n` mismatches (no mmCap extension). With `-n` ≥ 1 the accidental-match rate of this path rises further than the 0-mm curve below, which therefore acts as a lower bound.
 
-全長一致経路の偶然一致の理論値はアダプタ長に対して指数で増えます（リード 250bp・3e5 リード/サンプル想定）:
+The theoretical number of accidental full-length 0-mm matches grows exponentially with adapter length (assuming 250 bp reads, 3e5 reads per input):
 
-| アダプタ長 | 偶然一致/サンプル |
+| Adapter length | Accidental matches per input |
 |---|---|
-| 16bp | 約 0.035 回 |
-| 14bp | 約 0.55 回 |
-| 12bp | 約 9 回 |
+| 16 bp | ≈ 0.035 |
+| 14 bp | ≈ 0.55 |
+| 12 bp | ≈ 9 |
 
-`-n 2` 指定時のミスマッチ許容シードの誤発火は約 0.61 回/サンプルで、16bp 完全一致と同等の危険域です。本番運用 `-n 1` ではこの水準には入りません。`-F` を高くしすぎると短いアダプタがこの全長一致経路に入るため、上の曲線を見て設定してください。
+With `-n 2`, a mismatch-tolerant seed fires ≈ 0.61 times per input — the same danger zone as a 16 bp exact match. At `-n 1` this regime is not reached. If `-F` is set too low, short adapters fall into the full-length path; consult the curve above when choosing it.
 
-### 配向別規則
+### Orientation rules
 
-- fwd 断片検出: 断片の 5' 側を一括破棄（3' フランクを保持）
-- RC 断片検出: 断片の 3' 側を一括破棄（5' フランクを保持）
+- fwd fragment detected: the fragment's 5' side is discarded wholesale (3' flank kept)
+- RC fragment detected: the fragment's 3' side is discarded wholesale (5' flank kept)
 
-理由: アダプタ断片はプライマーとして働くため、滑り込んだ挿入配列は常に断片の 5' 境界側に位置します。接合点で切断して両側を残すスプライスは行いません — キメラ接合の偽リーディングを新生成してしまうためです。
+Rationale: adapter fragments act as primers, so the slipped-in insert always sits on the fragment's 5'-boundary side. No splice of the junction is performed — that would create false reads of the chimera junction.
 
-破棄後に保持するフランクが 20bp 未満になる発火は触りません（既存の端パスの担当）。ペアデータでは内部トリムは該当側だけに行い、相手側は既存の端パスのままです（fwd 発火で 3' フランク、RC 発火で 5' フランクが残るため正常な FR ペアとして扱えます）。
+A fire that would leave a kept flank shorter than 20 bp is left untouched (deferred to the existing end paths). On paired data the internal trim acts on the affected side only; the mate is handled by the existing end path (fwd fires keep the 3' flank, RC fires keep the 5' flank), so the pair remains a valid FR pair.
 
-### 感度の限界（実装実態）
+### Sensitivity limits (as implemented)
 
-- 切断領域の総ミスマッチ（シード + 延長）が `-n` 値 + mmCap 以内の断片は検出可能（本番 `-n 1`・30bp アダプタで総計 4 まで。シード窓は `-n` 値まで、延長窓は残予算）。アダプタ中央帯の 1mm 変異も本番 `-n 1` で検出できる（シード走査が `-n` 許容のため）。
-- 2mm 以上の変異断片は、断片内に無変異のシード長窓があり、かつ切断領域の総ミスマッチが上限以内に収まる場合のみ検出。
-- seedFloor 未満アダプタの全長一致経路は 0mm（完全一致）のみ。
-- 短断片（40bp 未満）と保持フランク 20bp 未満のケースは内部 Stage では扱わず、既存の 5'/3' 端パスの担当です。
+- Any fragment whose total mismatches in the cut region (seed + extension) stay within `-n` + mmCap is detectable (with `-n 1` and a 30 bp adapter: up to 4 in total; the seed window may consume up to `-n`, the extension the remainder). A 1-mm mutation in the central band of the adapter is detected at `-n 1` (the seed scan is `-n`-tolerant).
+- Mutant fragments with 2 or more mismatches are detected only when they contain a seed-length window with no more than `-n` mismatches AND the total in the cut region stays within the cap.
+- The full-length path for adapters shorter than seedFloor tolerates up to `-n` mismatches, with no mmCap extension.
+- Short reads (< 40 bp) and cases that would keep < 20 bp of flank are not handled by the internal stage; they belong to the existing 5'/3' end paths.
 
-### 統計
+### Statistics
 
-`-x` 有効時のみ、統計ファイルの Total 行の直後に行を追加されます（列追加ではない）:
+With `-x` active, one extra line is appended right after the Total line of the statistics file (an added line, not a column):
 
-    Internal_TSO_Trimmed_Fragments	(内部切断断片数)
+    Internal_TSO_Trimmed_Fragments	(number of reads with internally cut fragments)
 
-`-x` なしの統計ファイルにはこの行は現れません（従来版とのバイト同一性担保）。
-
-### 検証結果（合成バッテリ・本番A/B 実測値）
-
-合成バッテリ（tsotest/internal_test.py、`-m 8 -l 50` 運用基準）:
-
-- 設計アサーション 56/56 PASS・改定基準テーブル 31/31 PASS・exit 0。
-- 独立再走の 71 アサーション中 67 PASS。4 FAIL はすべて運用基準変更（`-l 50` フィルタ・案B の `-n` 許容）由来と補充検証で裁定済み（欠陥なし）。
-- 挿入単独アンカーは `-m 8` で 80bp のまま維持（純挿入非喫食）。
-- 0mm 全例切断、アダプタ中央帯 1mm 変異断片は `-n 1` で切断（`-F 18` 既定では全長一致経路は 0mm 固定を維持: 1mm 変異 6/6 残存）。
-- 乱数 5,000 リード（短辞書・TSO 辞書の両条件）で誤発火 0。
-- CLI 入力チェック: `-x -R 0` / `-x -R 1.5` / `-x -R -0.1` / `-x -F 3` はすべて exit 1、境界値 `-x -R 1 -F 4` は正常終了、`-x` なしでは `-F 3` も通る（チェックは `-x` 有効時のみ）。
-
-本番 A/B（S5・277-N、`-m 8 -n 1 -l 50 -r -p -g -x`、実装最終版の T8c 検証ゲートで全項目独立再走・合格）:
-
-- 切断領域の総ミスマッチ全数監査: 予算（`-n` + mmCap = 4）超えの喫食切断は修正後 0 本（S5 0 / 277-N 0。修正前ログの同一ロジック再生では 4,412 / 17,333 本）。
-- RC 側境界監査: 違反 0（RC 切断断片 総計 91,537）。
-- `-l 50` 通過数: S5 −97（−0.141%）、277-N −220（−0.100%、ペア基準 −0.0998%）。内部キメラ分相当の落ち込みのみで、内部位置で切断して 3' 側を捨てる fastp 方式が踏む −84.6% 級のペア通過劣化は発生していません。
-- 配向別規則の実データ監査: 逆配向違反 0。破棄された断片領域は全数アダプタ様配列と説明が付きます（説明不能 0）。制御群（本来内部断片を持たない群）の内部発火 0。
-- 位置別内訳: 修正前の fwd 側挿入喫食 48 / 138 本は修正後 1 / 0、RC 側 12 / 49 本は 0 / 3 に減少。
-- 回帰ゲート: `-x` なし出力は現行版と HEAD 版の独自ビルドで全入力（fastq・stats 含む）バイト一致。HEAD の `-m 5` 運用で既知のトリム数 119,276（S5）を厳密再現。`-x` あり出力も本番 6 入力・T8b 検証 12 項目・stats 5 項目ですべて一致。
+Without `-x` the line does not appear.
