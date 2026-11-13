@@ -36,13 +36,14 @@ private:
 
     std::vector<AdapterInfo> adapterArray;
     int matchLength;
-    int maxMismatches;
+    double maxMismatchValue;   // -n: >=1=許容ミスマッチ数 / <1=窓長に対する割合(floor(窓長*-n))
     int maxMismatchCost;
     bool recurse;
     bool partial;
     bool internalEnable;
     double seedRatio;
     int seedFloor;
+    int maxInwardOffset;   // 末端照合の内側オフセット上限(-K、既定0=従来どおり)
     long long internalTrimCount = 0;
     static constexpr int kKeepFlank = 20;
     mutable std::mutex statsMutex;
@@ -140,6 +141,13 @@ private:
         return best;
     }
 
+    // 許容ミスマッチ数: -n>=1=数, -n<1=窓長に対する割合(floor(窓長*-n))
+    int allowedMismatches(int winlen) const {
+        return maxMismatchValue < 1.0
+            ? (int)(maxMismatchValue * (double)winlen)
+            : (int)maxMismatchValue;
+    }
+
     // 内部TSO走査: 全リード長を走査し、アダプタ(A)とそのRC両方の完全一致シードで
     // 内部断片を検出する。プライマー性質に基づく配向別規則:
     //   fwd断片 = 挿入は断片の3'側 → 断片右端eで5'側を一括破棄(3'フランク保持)
@@ -164,10 +172,10 @@ private:
                 for (int o = 0; o < 2 && !cut; ++o) {
                     const std::string& ref = refs[o];
                     for (int i = 0; i + seedLen <= alen && !cut; ++i) {   // fullOnlyなら1窓(=全長)
-                        // 案B: シード窓ごとにミスマッチ数を数える走査。許容=maxMismatches(-n)。
+                        // 案B: シード窓ごとにミスマッチ数を数える走査。許容=-n(>=1=数/<1=窓長割合)。
                         // 全長一致経路(短アダプタ)も -n 許容。許容内の窓はミスマッチ最少優先・
                         // 同数は最左の順に試す。
-                        const int allow = maxMismatches;
+                        const int allow = allowedMismatches(seedLen);
                         const int nWin = (int)seq.length() - seedLen + 1;
                         std::vector<std::pair<int,int>> cand;   // (p, seedMm)
                         for (int mm0 = 0; mm0 <= allow; ++mm0) {
@@ -224,10 +232,10 @@ private:
     }
 
 public:
-    AdapterTrimmer(const std::vector<AdapterInfo>& adapterInfos, int matchLen = 8, int maxMismatchCount = 0, int maxCosts = 0, bool rc = false, bool p = false,
-                   bool internalEn = false, double seedR = 0.7, int seedF = 18)
-        : adapterArray(adapterInfos), matchLength(matchLen), maxMismatches(maxMismatchCount), maxMismatchCost(maxCosts), recurse(rc), partial(p),
-          internalEnable(internalEn), seedRatio(seedR), seedFloor(seedF) {
+    AdapterTrimmer(const std::vector<AdapterInfo>& adapterInfos, int matchLen = 8, double maxMismatchVal = 0, int maxCosts = 0, bool rc = false, bool p = false,
+                   bool internalEn = false, double seedR = 0.7, int seedF = 18, int maxInOff = 0)
+        : adapterArray(adapterInfos), matchLength(matchLen), maxMismatchValue(maxMismatchVal), maxMismatchCost(maxCosts), recurse(rc), partial(p),
+          internalEnable(internalEn), seedRatio(seedR), seedFloor(seedF), maxInwardOffset(maxInOff) {
     }
 
     std::pair<std::string, std::string> trimAdapters(const std::string& sequence, const std::string& quality) {
@@ -310,19 +318,24 @@ private:
             while (trimmed && trimmedSeq.length() >= static_cast<size_t>(matchLength)) {
                 trimmed = false;
                 for (int x = static_cast<int>(adapter.length()); x >= matchLength; --x) {
-                    if (trimmedSeq.length() >= static_cast<size_t>(x)) {
-                        std::string adapterEnd = adapter.substr(adapter.length() - x);
-                        // 先頭側: adapterの5'末端x塩基 (RCビューでのR先端断片=3'パス側で照合)
-                        std::string adapterHead = adapter.substr(0, x);
-                        std::string toMatch = trimmedSeq.substr(0, x);
-                        int mismatches = matchMismatchCount(adapterEnd, adapterHead, toMatch);
-                        bool shouldTrim = (maxMismatchCost > 0) ? (mismatches <= maxMismatchCost) : (mismatches <= maxMismatches);
-                        if (shouldTrim) {
-                            trimmedSeq = trimmedSeq.substr(x);
-                            trimmedQual = trimmedQual.substr(x);
-                            usedAdapterIndex = adapterIdx;
-                            if (recurse) trimmed = true;
-                            break;
+                    // -K: アダプタをリード末端にぴったり(off=0)に加え、1〜K塩基内側に
+                    // ずらした位置も照合する。外側に数塩基付いたリード
+                    // [X..][adapter][挿入]をアダプタごと一括切断できる。off=0優先=従来優先。
+                    for (int off = 0; off <= maxInwardOffset; ++off) {
+                        if (trimmedSeq.length() >= static_cast<size_t>(off + x)) {
+                            std::string adapterEnd = adapter.substr(adapter.length() - x);
+                            // 先頭側: adapterの5'末端x塩基 (RCビューでのR先端断片=3'パス側で照合)
+                            std::string adapterHead = adapter.substr(0, x);
+                            std::string toMatch = trimmedSeq.substr(off, x);
+                            int mismatches = matchMismatchCount(adapterEnd, adapterHead, toMatch);
+                            bool shouldTrim = (maxMismatchCost > 0) ? (mismatches <= maxMismatchCost) : (mismatches <= allowedMismatches(x));
+                            if (shouldTrim) {
+                                trimmedSeq = trimmedSeq.substr(off + x);
+                                trimmedQual = trimmedQual.substr(off + x);
+                                usedAdapterIndex = adapterIdx;
+                                if (recurse) trimmed = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -335,26 +348,30 @@ private:
                 trimmed = false;
                 // 最長一致優先(降順)で照合
                 for (int x = static_cast<int>(adapter.length()) - 1; x >= matchLength; --x) {
-                    if (trimmedSeq.length() >= static_cast<size_t>(x)) {
-                        for (size_t y = 0; y <= adapter.length() - x; ++y) {
-                            std::string adapterSub = adapter.substr(y, x);
-                            std::string toMatch = trimmedSeq.substr(0, x);
-                            // 部分配列は順配向のみ(候補スライスを両引数に渡す)
-                            int mismatches = matchMismatchCount(adapterSub, adapterSub, toMatch);
-                            bool shouldTrim = (maxMismatchCost > 0) ? (mismatches <= maxMismatchCost) : (mismatches <= maxMismatches);
-                            if (shouldTrim) {
-                                trimmedSeq = trimmedSeq.substr(x);
-                                trimmedQual = trimmedQual.substr(x);
-                                usedAdapterIndex = adapterIdx;
-                                if (recurse) {
-                                    trimmed = true;
-                                    again = (mismatches == 0) || (x >= 2 * matchLength);
+                    for (size_t y = 0; y <= adapter.length() - x; ++y) {
+                        std::string adapterSub = adapter.substr(y, x);
+                        // -K: 部分一致でも同様に内側オフセットを試す(off=0優先=従来優先)
+                        for (int off = 0; off <= maxInwardOffset; ++off) {
+                            if (trimmedSeq.length() >= static_cast<size_t>(off + x)) {
+                                std::string toMatch = trimmedSeq.substr(off, x);
+                                // 部分配列は順配向のみ(候補スライスを両引数に渡す)
+                                int mismatches = matchMismatchCount(adapterSub, adapterSub, toMatch);
+                                bool shouldTrim = (maxMismatchCost > 0) ? (mismatches <= maxMismatchCost) : (mismatches <= allowedMismatches(x));
+                                if (shouldTrim) {
+                                    trimmedSeq = trimmedSeq.substr(off + x);
+                                    trimmedQual = trimmedQual.substr(off + x);
+                                    usedAdapterIndex = adapterIdx;
+                                    if (recurse) {
+                                        trimmed = true;
+                                        again = (mismatches == 0) || (x >= 2 * matchLength);
+                                    }
+                                    break;
                                 }
-                                break;
                             }
                         }
                         if (trimmed) break;
                     }
+                    if (trimmed) break;
                 }
                 } while (again && trimmedSeq.length() >= static_cast<size_t>(matchLength));
             }
@@ -379,9 +396,9 @@ struct ThreadResult {
 };
 
 static void threadWorker(const std::vector<AdapterInfo>& adapterArray,
-                         int matchLength, int maxMismatches, int maxMismatchCost,
+                         int matchLength, double maxMismatchVal, int maxMismatchCost,
                          bool recurse, bool partial, int minReadLength,
-                         bool internalEnable, double seedRatio, int seedFloor,
+                         bool internalEnable, double seedRatio, int seedFloor, int maxInOff,
                          const std::vector<std::string>& readnames1,
                          const std::vector<std::string>& reads1,
                          const std::vector<std::string>& quals1,
@@ -398,8 +415,8 @@ static void threadWorker(const std::vector<AdapterInfo>& adapterArray,
     cleanAdapter.reserve(adapterArray.size());
     for (size_t a = 0; a < adapterArray.size(); ++a)
         cleanAdapter.emplace_back(adapterArray[a].name, adapterArray[a].sequence);
-    AdapterTrimmer trimmer(cleanAdapter, matchLength, maxMismatches, maxMismatchCost, recurse, partial,
-                           internalEnable, seedRatio, seedFloor);
+    AdapterTrimmer trimmer(cleanAdapter, matchLength, maxMismatchVal, maxMismatchCost, recurse, partial,
+                           internalEnable, seedRatio, seedFloor, maxInOff);
     const size_t pairedN = readnames1.size();
     for (size_t i = start; i < end; ++i) {
         if (i >= pairedN) {
@@ -680,13 +697,14 @@ private:
     std::vector<AdapterInfo> adapterArray;
     int matchLength;
     int minReadLength;
-    int maxMismatches;
+    double maxMismatchValue;
     int maxMismatchCost;
     bool recurse;
     bool partial;
     bool internalEnable;
     double seedRatio;
     int seedFloor;
+    int maxInwardOffset;
     bool isPaired;
     int numThreads;
     bool gzipOut;
@@ -712,22 +730,22 @@ public:
     FastqProcessor(const std::string& out1, const std::string& out2,
                    const std::string& single,
                    const std::vector<AdapterInfo>& adapterInfos,
-                   int matchLen, int minLen, int maxMismatchCount, int maxCosts,
+                   int matchLen, int minLen, double maxMismatchVal, int maxCosts,
                    bool rc, bool p, int threads, bool gzout = false,
-                   bool internalEn = false, double seedR = 0.7, int seedF = 18)
+                   bool internalEn = false, double seedR = 0.7, int seedF = 18, int maxInOff = 0)
         : outputFile1(out1), outputFile2(out2),
           singleOutputFile(single),
           adapterArray(adapterInfos),
           matchLength(matchLen),
           minReadLength(minLen),
-          maxMismatches(maxMismatchCount),
+          maxMismatchValue(maxMismatchVal),
           maxMismatchCost(maxCosts),
           recurse(rc),
           partial(p),
           isPaired(!out2.empty()),
           numThreads(threads),
           gzipOut(gzout),
-          internalEnable(internalEn), seedRatio(seedR), seedFloor(seedF) {}
+          internalEnable(internalEn), seedRatio(seedR), seedFloor(seedF), maxInwardOffset(maxInOff) {}
 
     ~FastqProcessor() { closeWriters(); }
 
@@ -762,9 +780,9 @@ public:
             if (start >= end) break;
             threads.emplace_back(threadWorker,
                 std::cref(adapterArray),
-                matchLength, maxMismatches, maxMismatchCost,
+                matchLength, maxMismatchValue, maxMismatchCost,
                 recurse, partial, minReadLength,
-                internalEnable, seedRatio, seedFloor,
+                internalEnable, seedRatio, seedFloor, maxInwardOffset,
                 std::cref(readnames1), std::cref(reads1), std::cref(quals1),
                 std::cref(readnames2), std::cref(reads2), std::cref(quals2),
                 std::cref(orphanNames), std::cref(orphanReads), std::cref(orphanQuals),
@@ -867,7 +885,7 @@ int main(int argc, char* argv[]) {
     std::string inputFile1, inputFile2, outputFile1, outputFile2, singleOutputFile, adapterFile;
     int matchLength = 8;
     int minReadLength = 0;
-    int maxMismatches = 0;
+    double maxMismatchValue = 0;
     int maxMismatchCost = 0;
     bool recurse = false;
     bool partial = false;
@@ -875,11 +893,12 @@ int main(int argc, char* argv[]) {
     bool internalEnable = false;
     double seedRatio = 0.7;
     int seedFloor = 18;
+    int maxInwardOffset = 0;
     int numThreads = 1;
     std::vector<AdapterInfo> adapterArray;
 
     int opt;
-    while ((opt = getopt(argc, argv, "i:I:o:O:s:f:m:l:n:c:t:xR:F:rpgh")) != -1) {
+    while ((opt = getopt(argc, argv, "i:I:o:O:s:f:m:l:n:c:t:xR:F:K:rpgh")) != -1) {
         switch (opt) {
             case 'i': inputFile1 = optarg; break;
             case 'I': inputFile2 = optarg; break;
@@ -889,12 +908,13 @@ int main(int argc, char* argv[]) {
             case 'f': adapterFile = optarg; break;
             case 'm': matchLength = std::stoi(optarg); break;
             case 'l': minReadLength = std::stoi(optarg); break;
-            case 'n': maxMismatches = std::stoi(optarg); break;
+            case 'n': maxMismatchValue = std::stod(optarg); break;
             case 'c': maxMismatchCost = std::stoi(optarg); break;
             case 't': numThreads = std::stoi(optarg); break;
             case 'x': internalEnable = true; break;
             case 'R': seedRatio = std::stod(optarg); break;
             case 'F': seedFloor = std::stoi(optarg); break;
+            case 'K': maxInwardOffset = std::stoi(optarg); break;
             case 'r': recurse = true; break;
             case 'p': partial = true; break;
             case 'g': gzipout = true; break;
@@ -910,8 +930,9 @@ int main(int argc, char* argv[]) {
                           << "-s [single_output]\n"
                           << "-m min_match_length (default: 8)\n"
                           << "-l min_read_length (default: 0)\n"
-                          << "-n max_mismatches_count (default: 0)\n"
+                          << "-n mismatch count (>=1) or mismatch rate per window (<1, e.g. 0.05) (default: 0)\n"
                           << "-c max_mismatch_cost (default: 0)\n"
+                          << "-K max_inward_offset_bp_for_end_trim (default: 0)\n"
                           << "-t num_threads (default: 1)\n"
                           << "-r trim recursively (default: false)\n"
                           << "-p trim partial adapters (default: false)\n"
@@ -925,6 +946,10 @@ int main(int argc, char* argv[]) {
 
     if (internalEnable && (seedRatio <= 0 || seedRatio > 1.0 || seedFloor < 4)) {
         std::cerr << "Error: -R must be in (0,1] and -F must be >= 4 when -x is enabled" << std::endl;
+        return 1;
+    }
+    if (maxInwardOffset < 0) {
+        std::cerr << "Error: -K must be >= 0" << std::endl;
         return 1;
     }
     if (inputFile1.empty() || outputFile1.empty() || adapterFile.empty()) {
@@ -961,7 +986,7 @@ int main(int argc, char* argv[]) {
     if (maxMismatchCost > 0)
         std::cout << "Max mismatch cost: " << maxMismatchCost << "\n";
     else
-        std::cout << "Max mismatches: " << maxMismatches << "\n";
+        std::cout << "Max mismatches: " << maxMismatchValue << "\n";
     std::cout << "Recursive: " << (recurse ? "true" : "false") << "\n"
               << "Partial: " << (partial ? "true" : "false") << "\n"
               << "Gzip output: " << (gzipout ? "true" : "false") << "\n"
@@ -999,7 +1024,7 @@ int main(int argc, char* argv[]) {
 
     FastqProcessor processor(outputFile1, outputFile2, singleOutputFile,
                              adapterArray, matchLength, minReadLength,
-                             maxMismatches, maxMismatchCost, recurse, partial, numThreads, gzipout, internalEnable, seedRatio, seedFloor);
+                             maxMismatchValue, maxMismatchCost, recurse, partial, numThreads, gzipout, internalEnable, seedRatio, seedFloor, maxInwardOffset);
 
     size_t recordsPerChunk = static_cast<size_t>(numThreads) * 100000ULL;
     bool isPaired = !inputFile2.empty();

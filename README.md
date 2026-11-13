@@ -30,6 +30,22 @@ Adapter-derived fragments that slipped into the interior of a read during amplif
 
 On `-m`: the code default is 8. With smaller match lengths (e.g. 5), short slices of the adapter (≤ 7 bp) can fire by chance in the partial-matching chain of the end-trim path and nibble into pure-insert ends: a pure-insert anchor read of 80 bp was measured to be reduced to 67 bp under such a setting. `-m 8` eliminates this. `-m` and `-n` are tuning knobs; adjust them as operation parameters rather than changing the code.
 
+### -n: mismatch tolerance mode (fixed count or window-length ratio)
+
+`-n` accepts a decimal number and switches interpretation depending on the value:
+
+- `-n` ≥ 1: allowed mismatches per matching window (fixed count)
+- 0 ≤ `-n` < 1: mismatch ratio per window — allowed mismatches per window = floor(window length × `-n`)
+
+With `-n 0.05`, a 30 bp window tolerates 1 mismatch, a 21 bp window tolerates 1, and windows of 19 bp or fewer tolerate none. Long windows keep their mismatch sensitivity, while short windows stop tolerating any mismatches and therefore stop firing by chance in short slices.
+
+### -K: inward-offset end trimming
+
+End trimming by default matches the adapter exactly flush with the read end (offset 0). `-K <bp>` additionally tries matching positions 1–K bases inward from the read end. When a match is found at inward offset k, the read is cut as a whole k + x bases from that end (the k extra bases and the adapter are discarded together). This applies to the 5' end path, the 3' end path (RC view) and the partial-matching path alike; offset 0 is tried first, so the existing behavior keeps priority. Default 0 = unchanged behavior.
+
+Note: with `-K 4` and `-n 1`, the additional inward-offset windows multiply the accidental fires in short windows (measured on random control reads: about 3.6× more false trims than `-K 0`). With `-n 0.05` (ratio mode), the short-window tolerance drops to 0 mismatches and the false-fire count returns to the exact-match baseline, while long windows keep their 1-mismatch sensitivity.
+
+
 ### Detection mechanism
 
 - Seed length = clamp(round(`-R` × adapter length), `-F`, adapter length). With a 30 bp adapter and the defaults this is 21 bp.
