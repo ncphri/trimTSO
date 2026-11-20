@@ -338,6 +338,7 @@ private:
                             }
                         }
                     }
+                    if (trimmed) break;   // 切断成功でxループを抜けwhile冒頭から再検索(最長一致優先を維持)。切断済みリードへの小さいx連続発火による切断点ドリフトと連鎖停止を防止
                 }
             }
             if (!trimmed && partial) {
