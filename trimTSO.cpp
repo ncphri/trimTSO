@@ -394,6 +394,10 @@ struct ThreadResult {
     std::string singleOut;
     std::vector<AdapterInfo> stats;
     long long internalTrimCount = 0;
+    // -l pair-rule counters (PE only): pairs kept 1:1 with one short mate,
+    // and pairs silently dropped because both mates fell below min length.
+    long long matePassthrough = 0;
+    long long pairDroppedBothShort = 0;
 };
 
 static void threadWorker(const std::vector<AdapterInfo>& adapterArray,
@@ -433,14 +437,20 @@ static void threadWorker(const std::vector<AdapterInfo>& adapterArray,
         if (isPaired) {
             auto [trimmedSeq1, trimmedQual1] = trimmer.trimAdapters(reads1[i], quals1[i]);
             auto [trimmedSeq2, trimmedQual2] = trimmer.trimAdapters(reads2[i], quals2[i]);
-            if (trimmedSeq1.size() >= static_cast<size_t>(minReadLength) &&
+            // -l pair rule (cutadapt-compliant): keep the pair 1:1 in t1/t2 when at
+            // least one mate reaches min length after trimming; the short mate is
+            // passed through as-is. When BOTH mates fall below min length the pair
+            // is silently dropped (neither t1/t2 nor -s). -s stays reserved for its
+            // existing producers only (orphan mates above).
+            if (trimmedSeq1.size() >= static_cast<size_t>(minReadLength) ||
                 trimmedSeq2.size() >= static_cast<size_t>(minReadLength)) {
                 result.out1 += readnames1[i] + "\n" + trimmedSeq1 + "\n+\n" + trimmedQual1 + "\n";
                 result.out2 += readnames2[i] + "\n" + trimmedSeq2 + "\n+\n" + trimmedQual2 + "\n";
-            } else if (trimmedSeq1.size() >= static_cast<size_t>(minReadLength)) {
-                result.singleOut += readnames1[i] + "\n" + trimmedSeq1 + "\n+\n" + trimmedQual1 + "\n";
-            } else if (trimmedSeq2.size() >= static_cast<size_t>(minReadLength)) {
-                result.singleOut += readnames2[i] + "\n" + trimmedSeq2 + "\n+\n" + trimmedQual2 + "\n";
+                if (trimmedSeq1.size() < static_cast<size_t>(minReadLength) ||
+                    trimmedSeq2.size() < static_cast<size_t>(minReadLength))
+                    result.matePassthrough++;
+            } else {
+                result.pairDroppedBothShort++;
             }
         } else {
             auto [trimmedSeq, trimmedQual] = trimmer.trimAdapters(reads1[i], quals1[i]);
@@ -710,6 +720,8 @@ private:
     int numThreads;
     bool gzipOut;
     long long internalTrimCount = 0;
+    long long matePassthroughCount = 0;
+    long long pairDroppedBothShortCount = 0;
     FastqWriter writer1_, writer2_, writerSingle_;
     bool writersOpen_ = false;
 
@@ -805,6 +817,8 @@ public:
             for (size_t a = 0; a < adapterArray.size() && a < results[t].stats.size(); ++a)
                 adapterArray[a].trimCount += results[t].stats[a].trimCount;
             internalTrimCount += results[t].internalTrimCount;
+            matePassthroughCount += results[t].matePassthrough;
+            pairDroppedBothShortCount += results[t].pairDroppedBothShort;
         }
     }
 
@@ -822,6 +836,10 @@ public:
         std::cout << "----------------------------------------" << std::endl;
         std::cout << "Total trimmed reads: " << totalTrimmed << std::endl;
         if (internalEnable) std::cout << "Internal TSO trims: " << internalTrimCount << std::endl;
+        if (isPaired) {
+            std::cout << "mate_passthrough: " << matePassthroughCount << std::endl;
+            std::cout << "pair_dropped_both_short: " << pairDroppedBothShortCount << std::endl;
+        }
     }
 
     void writeTrimStatsToFile(const std::string& filename) const {
@@ -838,6 +856,10 @@ public:
         }
         outFile << "Total\tAll_Adapters\t" << totalTrimmed << "\n";
         if (internalEnable) outFile << "Internal_TSO_Trimmed_Fragments\t" << internalTrimCount << "\n";
+        if (isPaired) {
+            outFile << "mate_passthrough\t" << matePassthroughCount << "\n";
+            outFile << "pair_dropped_both_short\t" << pairDroppedBothShortCount << "\n";
+        }
         outFile.close();
         std::cout << "Trimming statistics written to: " << filename << std::endl;
     }
